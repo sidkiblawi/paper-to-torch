@@ -1,0 +1,367 @@
+#%% md
+# 12 — Inside `torch.nn`: modules, parameters, buffers, and hooks
+
+**Why this matters:** every notebook so far has checked your code against a built-in such as `F.layer_norm`, `nn.Linear`, or `nn.BatchNorm1d`. This notebook opens those built-ins up. You'll rebuild the ones you've been leaning on, **exactly**: same outputs, same initial weights under the same seed, same `state_dict`. Once you can do that, the library stops being a black box, and "port this paper's code to PyTorch" gets a lot easier.
+
+**Papers**
+- He et al. (2015), *Delving Deep into Rectifiers* (Kaiming init), Eq. 10
+- Ioffe & Szegedy (2015), *Batch Normalization*, Algorithm 2 (inference)
+- Srivastava et al. (2014), *Dropout*, §2 and §10
+
+**You will learn**
+- how `nn.Module` finds your parameters (and the two ways it silently *doesn't*)
+- where `nn.Linear`'s default init comes from, and what it does to activation scale
+- parameters vs. **buffers**, and what `train()` / `eval()` actually switch
+- that `nn.Embedding` is indexing and `nn.Dropout` is a masked multiply
+- forward hooks, for reading activations out of a model you didn't write
+
+**Rule:** you may use `nn.Module`, `nn.Parameter`, and `register_buffer` / `register_forward_hook`. Don't use the built-in you're rebuilding (e.g. no `nn.Linear` inside `MyLinear`, no `F.dropout` inside `dropout`).
+
+#%% code
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from p2t import check, check_grad, check_shape, seed
+
+seed(0)
+
+#%% md
+## 1. How a module finds its parameters
+
+`nn.Module` overrides `__setattr__`. When you write `self.foo = value` inside a module, it checks the type of `value`:
+
+| you assign | it goes into | shows up in `.parameters()` | in `state_dict()` | moved by `.to()` / `.double()` |
+|---|---|---|---|---|
+| `nn.Parameter` | `self._parameters` | ✅ | ✅ | ✅ |
+| `nn.Module` (incl. `nn.ModuleList`) | `self._modules` | its params, recursively | ✅ (prefixed `foo.`) | ✅ |
+| `register_buffer("foo", t)` | `self._buffers` | ❌ | ✅ (unless `persistent=False`) | ✅ |
+| a plain `torch.Tensor` | a normal attribute | ❌ | ❌ | ❌ |
+| a Python `list` of modules | a normal attribute | ❌ | ❌ | ❌ |
+
+The last two rows are the silent failures. The optimizer never sees those weights, they never get saved, and `.cuda()` leaves them behind. Nothing errors until much later.
+
+Predict what the cell below prints before you run it.
+
+#%% code
+class BrokenMLP(nn.Module):
+    def __init__(self, d=8, n_layers=2):
+        super().__init__()
+        self.layers = [nn.Linear(d, d) for _ in range(n_layers)]  # plain list
+        self.scale = torch.ones(d)                                  # meant to be learned
+        self.mask = torch.tril(torch.ones(d, d))                    # fixed, but should move with the model
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = torch.tanh(layer(x))
+        return x * self.scale
+
+
+m = BrokenMLP()
+print("parameters:", [n for n, _ in m.named_parameters()])
+print("state_dict:", list(m.state_dict().keys()))
+
+#%% md
+### Exercise 1 — fix it
+
+Write `FixedMLP` with the same behavior, where the linear layers and `scale` are trainable and `mask` is a (persistent) buffer.
+
+#%% code
+class FixedMLP(nn.Module):
+    def __init__(self, d=8, n_layers=2):
+        super().__init__()
+        ### BEGIN SOLUTION
+        self.layers = nn.ModuleList([nn.Linear(d, d) for _ in range(n_layers)])
+        self.scale = nn.Parameter(torch.ones(d))
+        self.register_buffer("mask", torch.tril(torch.ones(d, d)))
+        ### END SOLUTION
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = torch.tanh(layer(x))
+        return x * self.scale
+
+#%% code
+m = FixedMLP()
+expected_params = {"layers.0.weight", "layers.0.bias", "layers.1.weight", "layers.1.bias", "scale"}
+assert {n for n, _ in m.named_parameters()} == expected_params, f"❌ parameters: {[n for n, _ in m.named_parameters()]}"
+print("✅ parameters registered")
+assert set(m.state_dict()) == expected_params | {"mask"}, f"❌ state_dict: {list(m.state_dict())}"
+print("✅ state_dict includes the buffer")
+m.double()
+assert all(t.dtype == torch.float64 for t in m.state_dict().values()), "❌ something didn't move with .double()"
+print("✅ .double() reaches everything")
+
+#%% md
+## 2. `nn.Linear` and its default init
+
+`nn.Linear(in, out)` stores `weight: (out, in)` and `bias: (out,)` and computes `x @ W.T + b` (notebook 00). The interesting part is `reset_parameters()`, which does:
+
+```python
+init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+bound = 1 / math.sqrt(fan_in)
+init.uniform_(self.bias, -bound, bound)
+```
+
+**Decode it.** He et al. (2015) Eq. 10 wants $\mathrm{Var}[w] = 2/n_{in}$ for ReLU nets. `kaiming_uniform_` generalizes that to a leaky ReLU with slope $a$: gain $= \sqrt{2/(1+a^2)}$, and a uniform $U(-\text{bound}, \text{bound})$ has variance $\text{bound}^2/3$, so
+$$\text{bound} = \text{gain}\cdot\sqrt{3/n_{in}}.$$
+Plug in $a = \sqrt 5$ and it simplifies. Do the algebra: what's the weight bound?
+
+### Exercise 2 — `MyLinear`, with bit-identical init
+
+Draw the weight **first**, then the bias, each with a single `uniform_` call on a fresh `torch.empty` tensor. If your bound is right and the order is right, you'll get *exactly* the same numbers as `nn.Linear` from the same seed.
+
+#%% code
+class MyLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        ### BEGIN SOLUTION
+        bound = 1 / math.sqrt(in_features)  # gain·sqrt(3/fan_in) with gain = sqrt(2/(1+5)) = sqrt(1/3)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features).uniform_(-bound, bound))
+        self.bias = nn.Parameter(torch.empty(out_features).uniform_(-bound, bound)) if bias else None
+        ### END SOLUTION
+
+    def forward(self, x):
+        ### BEGIN SOLUTION
+        out = x @ self.weight.T
+        return out + self.bias if self.bias is not None else out
+        ### END SOLUTION
+
+#%% code
+torch.manual_seed(42); ref = nn.Linear(20, 7)
+torch.manual_seed(42); mine = MyLinear(20, 7)
+check("weight init (same seed → same numbers)", mine.weight, ref.weight, atol=0, rtol=0)
+check("bias init", mine.bias, ref.bias, atol=0, rtol=0)
+x = torch.randn(4, 3, 20)
+check("forward", mine(x), ref(x))
+torch.manual_seed(0); ref_nb = nn.Linear(20, 7, bias=False)
+torch.manual_seed(0); mine_nb = MyLinear(20, 7, bias=False)
+check("bias=False", mine_nb(x), ref_nb(x))
+
+#%% md
+### Experiment — what the default init does to depth
+
+With $\text{bound} = 1/\sqrt{n_{in}}$, each weight has variance $\frac{1}{3n_{in}}$, so for unit-variance input, $\mathrm{Var}[(Wx)_i] = n_{in}\cdot\frac{1}{3n_{in}} = \frac13$. Each layer shrinks the signal's variance by 3×, before the activation takes its own cut.
+
+Predict the curves first, then run the cell. It pushes unit-variance data through 20 `Linear → ReLU` layers with PyTorch's default init and with He init (`kaiming_normal_(nonlinearity="relu")`).
+
+#%% code
+def activation_stds(init, depth=20, d=512):
+    torch.manual_seed(0)
+    x, stds = torch.randn(1024, d), []
+    for _ in range(depth):
+        layer = nn.Linear(d, d, bias=False)
+        if init == "he":
+            nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+        x = torch.relu(layer(x))
+        stds.append(x.std().item())
+    return stds
+
+plt.semilogy(activation_stds("default"), label="nn.Linear default (a=√5)")
+plt.semilogy(activation_stds("he"), label="He init (Var = 2/n_in)")
+plt.xlabel("layer"); plt.ylabel("activation std"); plt.legend(); plt.show()
+
+#%% md
+Deep plain stacks die under the default init. That's fine in practice because modern nets put a normalization layer or a residual connection around every block, but it's why papers that train deep MLPs usually state their init explicitly. When a paper says "we use He init", PyTorch's default is **not** that.
+
+## 3. Buffers, and what `train()` / `eval()` switch
+
+`model.train()` and `model.eval()` do one thing: set `self.training` on every submodule. Each layer decides what that flag means. For BatchNorm, it means batch statistics vs. running statistics (notebook 02). Those running statistics are **buffers**: state that's saved and moved with the model, but that the optimizer never touches.
+
+Note that `eval()` does **not** turn off autograd. That's `torch.no_grad()`, a separate switch.
+
+`nn.BatchNorm1d(D)` has:
+- parameters `weight` (γ, init 1) and `bias` (β, init 0)
+- buffers `running_mean` (init 0), `running_var` (init 1), and `num_batches_tracked` (an int64 scalar, init 0, incremented once per training forward)
+
+### Exercise 3 — `MyBatchNorm1d`
+
+In training mode, normalize with the (biased) batch statistics and update the running buffers with the rule from notebook 02 (the running variance uses the **unbiased** estimate). In eval mode, normalize with the running buffers and update nothing. Use the same attribute names as PyTorch, so the two `state_dict`s are interchangeable.
+
+Update buffers under `torch.no_grad()`. The running stats must not become part of the autograd graph.
+
+#%% code
+class MyBatchNorm1d(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.eps, self.momentum = eps, momentum
+        ### BEGIN SOLUTION
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var", torch.ones(num_features))
+        self.register_buffer("num_batches_tracked", torch.tensor(0, dtype=torch.long))
+        ### END SOLUTION
+
+    def forward(self, x):
+        """x: (N, D) -> (N, D)"""
+        ### BEGIN SOLUTION
+        if self.training:
+            mu = x.mean(0)
+            var = (x - mu).pow(2).mean(0)                                   # biased: used to normalize
+            with torch.no_grad():
+                n = x.shape[0]
+                self.running_mean.mul_(1 - self.momentum).add_(self.momentum * mu)
+                self.running_var.mul_(1 - self.momentum).add_(self.momentum * var * n / (n - 1))
+                self.num_batches_tracked += 1
+        else:
+            mu, var = self.running_mean, self.running_var
+        return self.weight * (x - mu) / torch.sqrt(var + self.eps) + self.bias
+        ### END SOLUTION
+
+#%% code
+ref, mine = nn.BatchNorm1d(6), MyBatchNorm1d(6)
+assert list(mine.state_dict()) == list(ref.state_dict()), f"❌ state_dict keys {list(mine.state_dict())}"
+print("✅ same state_dict keys, same order")
+assert [n for n, _ in mine.named_parameters()] == ["weight", "bias"], "❌ buffers must not be parameters"
+print("✅ only weight and bias are parameters")
+
+with torch.no_grad():  # random affine params, so the check is meaningful
+    ref.weight.normal_(); ref.bias.normal_()
+mine.load_state_dict(ref.state_dict())
+for step in range(3):
+    x = torch.randn(16, 6) * 2 + 1
+    check(f"train step {step}", mine(x), ref(x))
+check("running_mean", mine.running_mean, ref.running_mean)
+check("running_var", mine.running_var, ref.running_var)
+check("num_batches_tracked", mine.num_batches_tracked, ref.num_batches_tracked)
+
+mine.eval(); ref.eval()
+x = torch.randn(5, 6)
+check("eval forward uses running stats", mine(x), ref(x))
+before = mine.running_mean.clone(); mine(x)
+check("eval doesn't update buffers", mine.running_mean, before)
+mine.train(); ref.train()
+check_grad("grad (train mode)", mine, ref, torch.randn(16, 6))
+
+#%% md
+## 4. `nn.Dropout` is a masked multiply
+
+Srivastava et al. (2014) keep each unit with probability $p$ during training, and at test time **scale the weights by $p$** (§10) so expected activations match. PyTorch's `p` is the *drop* probability, and it moves the scaling to training time instead ("inverted dropout"):
+$$y = \frac{m \odot x}{1 - p}, \qquad m_i \sim \mathrm{Bernoulli}(1-p)$$
+Then eval mode is the identity, and inference code never needs to know dropout existed.
+
+### Exercise 4 — dropout
+
+Build the mask with `torch.empty_like(x).bernoulli_(1 - p)`. That's the same RNG call PyTorch makes on CPU, so from the same seed you'll get the same mask.
+
+#%% code
+def dropout(x, p=0.5, training=True):
+    ### BEGIN SOLUTION
+    if not training or p == 0:
+        return x
+    mask = torch.empty_like(x).bernoulli_(1 - p)
+    return x * mask / (1 - p)
+    ### END SOLUTION
+
+
+class MyDropout(nn.Module):
+    def __init__(self, p=0.5):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x):
+        ### BEGIN SOLUTION
+        return dropout(x, self.p, self.training)
+        ### END SOLUTION
+
+#%% code
+x = torch.randn(64, 32)
+for p in [0.1, 0.5]:
+    torch.manual_seed(7); ref = F.dropout(x, p, training=True)
+    torch.manual_seed(7); got = dropout(x, p)
+    check(f"dropout p={p} (same seed → same mask)", got, ref)
+check("eval mode is identity", MyDropout(0.5).eval()(x), x)
+y = MyDropout(0.3).train()(torch.ones(200_000))
+print(f"fraction zeroed: {(y == 0).float().mean():.3f} (want ≈ 0.3), mean: {y.mean():.3f} (want ≈ 1.0)")
+
+#%% md
+## 5. `nn.Embedding` is indexing
+
+An embedding table `W: (V, D)` maps token ids to vectors. The paper version is "multiply a one-hot vector by $W$", and the efficient version is `W[idx]`. They compute the same thing, but one of them builds a `(B, T, V)` tensor of zeros.
+
+`padding_idx` is a less obvious detail. The row `W[padding_idx]` is still *returned* by the forward pass, but it **never receives gradient**, so it stays at its initial value (PyTorch initializes it to zero).
+
+### Exercise 5 — embedding with `padding_idx`
+
+Return `W[idx]` for any index shape, with no gradient flowing to row `padding_idx`. Hint: `torch.where(cond, a.detach(), a)` keeps the value and cuts the gradient wherever `cond` is true.
+
+#%% code
+def embedding(idx, W, padding_idx=None):
+    """idx: (...) int64, W: (V, D) -> (..., D)"""
+    ### BEGIN SOLUTION
+    out = W[idx]                                          # (..., D)
+    if padding_idx is None:
+        return out
+    is_pad = (idx == padding_idx).unsqueeze(-1)           # (..., 1)
+    return torch.where(is_pad, out.detach(), out)
+    ### END SOLUTION
+
+#%% code
+V, D = 10, 4
+W = torch.randn(V, D)
+idx = torch.tensor([[1, 0, 3, 0], [9, 2, 0, 1]])
+check("embedding", embedding(idx, W), F.embedding(idx, W))
+check("one-hot @ W is the same thing", F.one_hot(idx, V).float() @ W, F.embedding(idx, W))
+check_grad("embedding grad", lambda W: embedding(idx, W), lambda W: F.embedding(idx, W), W)
+check_grad("embedding grad, padding_idx=0", lambda W: embedding(idx, W, 0),
+           lambda W: F.embedding(idx, W, padding_idx=0), W)
+
+#%% md
+## 6. Forward hooks
+
+`module(x)` isn't just `module.forward(x)`. `nn.Module.__call__` runs any registered **hooks** around `forward`. A forward hook is `fn(module, inputs, output)`, and it's how you read intermediate activations out of a model without editing its code (interpretability work, feature extraction, and debugging NaNs all use this).
+
+`register_forward_hook` returns a handle. Call `handle.remove()` when you're done, or the hook stays attached forever.
+
+### Exercise 6 — record every `nn.Linear` output
+
+Use `model.named_modules()` to find every `nn.Linear`, hook it, run the model once, and remove the hooks. Return `{name: output}`, with outputs detached.
+
+#%% code
+def record_linear_outputs(model, x):
+    ### BEGIN SOLUTION
+    acts, handles = {}, []
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            def hook(module, inputs, output, name=name):  # bind name now, not at call time
+                acts[name] = output.detach()
+            handles.append(mod.register_forward_hook(hook))
+    try:
+        model(x)
+    finally:
+        for h in handles:
+            h.remove()
+    return acts
+    ### END SOLUTION
+
+#%% code
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Sequential(nn.Linear(8, 8), nn.Tanh()), nn.Linear(8, 2))
+x = torch.randn(3, 4)
+acts = record_linear_outputs(model, x)
+assert list(acts) == ["0", "2.0", "3"], f"❌ names {list(acts)}"
+print("✅ found all three Linear layers (including the nested one)")
+h0 = model[0](x); h1 = model[2][0](torch.relu(h0))
+check("layer 0 output", acts["0"], h0)
+check("layer 2.0 output", acts["2.0"], h1)
+check("layer 3 output", acts["3"], model(x))
+assert all(len(m._forward_hooks) == 0 for m in model.modules()), "❌ hooks left attached"
+print("✅ all hooks removed")
+
+#%% md
+The `name=name` default argument in the solution isn't decoration. Python closures capture *variables*, not values, so without it every hook would see the last `name` from the loop. It's the same bug as the classic `[lambda: i for i in range(3)]`.
+
+## Reflection
+1. `model.eval()` vs. `torch.no_grad()`: what does each one change? Which do you want for validation, and why is it usually both?
+2. Why is `num_batches_tracked` a buffer rather than a Python int? (Look at what `nn.BatchNorm1d(momentum=None)` does.)
+3. Notebook 04 builds RoPE `cos`/`sin` tables. If you put them in a module, should they be parameters, persistent buffers, or `register_buffer(..., persistent=False)`? Why?
+4. You load a checkpoint and get `Missing key(s) in state_dict: "layers.0.weight", ...`. Given section 1, what are the likely causes?
+
+#%% md solution
+**Answers**
+1. `eval()` only flips `self.training` (dropout off, BN uses running stats). `no_grad()` stops autograd from recording, which saves memory and time. For validation you want both: eval semantics, and no graph.
+2. It has to be saved in the checkpoint and moved with the model, and with `momentum=None` BN uses a cumulative average with factor `1 / num_batches_tracked`, so resuming training needs the exact count. Python ints aren't part of the `state_dict`.
+3. `persistent=False` buffers. They aren't learned (not parameters), and they must move with `.to(device)` and `.half()` (so not plain tensors). They're a deterministic function of the config, so saving them only bloats checkpoints, and it breaks loading when you change the max sequence length.
+4. The saving model stored its layers in a plain list (so they were never saved), the names differ (e.g. `nn.Sequential` gives `0.weight` while attributes give `fc1.weight`), or the checkpoint was saved from a wrapped model (`module.` prefix from `DataParallel`/DDP, `_orig_mod.` from `torch.compile`).
