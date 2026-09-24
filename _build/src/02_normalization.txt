@@ -1,0 +1,168 @@
+#%% md
+# 02 — Normalization: BatchNorm, LayerNorm, RMSNorm
+
+**Why this matters:** these three layers use nearly identical equations, and they differ in **which axis the statistics are computed over**. Reading "$\mu = \frac{1}{m}\sum_i x_i$" and working out *what $i$ ranges over* is the whole skill here.
+
+**Papers**
+- Ioffe & Szegedy (2015), *Batch Normalization*, Algorithm 1
+- Ba, Kiros & Hinton (2016), *Layer Normalization*, Eq. 3–4
+- Zhang & Sennrich (2019), *Root Mean Square Layer Normalization*, Eq. 4
+
+**Rule:** don't use `F.batch_norm`, `F.layer_norm`, `F.rms_norm`, `torch.var`, or `torch.std` in your solutions. Use `mean`, `pow`, and `sqrt`.
+
+#%% code
+import torch
+import torch.nn.functional as F
+from p2t import check, check_grad, seed
+
+seed(0)
+
+#%% md
+## 1. BatchNorm (training mode)
+
+From Algorithm 1 of the paper, for a mini-batch $\mathcal{B} = \{x_1, \dots, x_m\}$ **of one activation**:
+
+$$\mu_\mathcal{B} = \frac{1}{m}\sum_{i=1}^m x_i \qquad \sigma^2_\mathcal{B} = \frac{1}{m}\sum_{i=1}^m (x_i - \mu_\mathcal{B})^2$$
+$$\hat{x}_i = \frac{x_i - \mu_\mathcal{B}}{\sqrt{\sigma^2_\mathcal{B} + \epsilon}} \qquad y_i = \gamma\,\hat{x}_i + \beta$$
+
+**Decode it:** the phrase "of one activation" is easy to miss. The paper normalizes *each feature separately*, and $i$ indexes the **batch**. For `x: (N, D)`, you reduce over dim 0 and get `D` means. $\gamma, \beta \in \mathbb{R}^D$ are learned.
+
+Also note: $\sigma^2_\mathcal{B}$ divides by $m$, not $m-1$. That's the **biased** variance.
+
+### Exercise 1 — BatchNorm forward (training)
+
+#%% code
+def batchnorm_train(x, gamma, beta, eps=1e-5):
+    """x: (N, D), gamma/beta: (D,) -> (N, D)"""
+    ### BEGIN SOLUTION
+    mu = x.mean(0, keepdim=True)                     # (1, D)
+    var = (x - mu).pow(2).mean(0, keepdim=True)      # (1, D), biased
+    xhat = (x - mu) / torch.sqrt(var + eps)
+    return gamma * xhat + beta
+    ### END SOLUTION
+
+#%% code
+x = torch.randn(32, 8) * 3 + 1
+gamma, beta = torch.randn(8), torch.randn(8)
+ref = lambda x, g, b: F.batch_norm(x, None, None, g, b, training=True, eps=1e-5)
+check("batchnorm_train", batchnorm_train(x, gamma, beta), ref(x, gamma, beta))
+check_grad("batchnorm_train", batchnorm_train, ref, x, gamma, beta)
+
+#%% md
+### Exercise 2 — running statistics (a classic gotcha)
+
+At inference time you can't use batch statistics, so BN keeps exponential moving averages. PyTorch's update rule (see the `nn.BatchNorm1d` docs) is
+$$\hat\mu \leftarrow (1-\text{momentum})\,\hat\mu + \text{momentum}\cdot\mu_\mathcal{B}$$
+$$\hat\sigma^2 \leftarrow (1-\text{momentum})\,\hat\sigma^2 + \text{momentum}\cdot\frac{m}{m-1}\sigma^2_\mathcal{B}$$
+
+The running variance uses the **unbiased** estimate. Algorithm 2 of the paper also says this: "$\mathrm{Var}[x] \leftarrow \frac{m}{m-1}\mathrm{E}_\mathcal{B}[\sigma^2_\mathcal{B}]$". Details like this are why reading the whole paper matters.
+
+Return the updated `(running_mean, running_var)`. Don't modify the inputs in place.
+
+#%% code
+def batchnorm_update_running(x, running_mean, running_var, momentum=0.1):
+    """x: (N, D) -> (new_running_mean, new_running_var), each (D,)"""
+    ### BEGIN SOLUTION
+    m = x.shape[0]
+    mu = x.mean(0)
+    var_unbiased = (x - mu).pow(2).sum(0) / (m - 1)
+    new_mean = (1 - momentum) * running_mean + momentum * mu
+    new_var = (1 - momentum) * running_var + momentum * var_unbiased
+    return new_mean, new_var
+    ### END SOLUTION
+
+#%% code
+rm, rv = torch.zeros(8), torch.ones(8)
+rm_ref, rv_ref = rm.clone(), rv.clone()
+F.batch_norm(x, rm_ref, rv_ref, training=True, momentum=0.1)  # updates rm_ref / rv_ref in place
+new_rm, new_rv = batchnorm_update_running(x, rm, rv)
+check("running_mean", new_rm, rm_ref)
+check("running_var (unbiased!)", new_rv, rv_ref)
+
+#%% md
+## 2. LayerNorm
+
+Ba et al. (2016), Eq. 4. For a layer with $H$ hidden units, **per training case**:
+$$\mu = \frac{1}{H}\sum_{i=1}^H a_i \qquad \sigma = \sqrt{\frac{1}{H}\sum_{i=1}^H (a_i - \mu)^2}$$
+
+**Decode it:** the equation looks just like BN's, but now $i$ ranges over **hidden units** within one example. For `x: (B, T, D)`, you reduce over the last dim and get `B·T` separate means. No example ever sees another example's statistics, so it behaves identically at train and test time and works with batch size 1.
+
+(The paper puts $\epsilon$ in a slightly different place. Use the PyTorch convention $\frac{x-\mu}{\sqrt{\sigma^2+\epsilon}}$ so the check passes.)
+
+### Exercise 3 — LayerNorm
+
+#%% code
+def layernorm(x, gamma, beta, eps=1e-5):
+    """x: (..., D), gamma/beta: (D,)"""
+    ### BEGIN SOLUTION
+    mu = x.mean(-1, keepdim=True)
+    var = (x - mu).pow(2).mean(-1, keepdim=True)
+    return gamma * (x - mu) / torch.sqrt(var + eps) + beta
+    ### END SOLUTION
+
+#%% code
+x = torch.randn(4, 10, 16) * 2 + 0.5
+gamma, beta = torch.randn(16), torch.randn(16)
+ref = lambda x, g, b: F.layer_norm(x, (16,), g, b, eps=1e-5)
+check("layernorm", layernorm(x, gamma, beta), ref(x, gamma, beta))
+check_grad("layernorm", layernorm, ref, x, gamma, beta)
+
+#%% md
+## 3. RMSNorm
+
+Zhang & Sennrich (2019) hypothesize that LayerNorm's *re-centering* (subtracting $\mu$) is unnecessary and that only *re-scaling* matters:
+$$\bar{a}_i = \frac{a_i}{\mathrm{RMS}(\mathbf{a})}\,g_i, \qquad \mathrm{RMS}(\mathbf{a}) = \sqrt{\frac{1}{n}\sum_{i=1}^n a_i^2}$$
+It's cheaper (one reduction instead of two) and is used in LLaMA, Mistral, Gemma, and others. PyTorch puts $\epsilon$ inside the square root.
+
+### Exercise 4 — RMSNorm
+
+#%% code
+def rmsnorm(x, g, eps=1e-6):
+    """x: (..., D), g: (D,)"""
+    ### BEGIN SOLUTION
+    rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return x / rms * g
+    ### END SOLUTION
+
+#%% code
+g = torch.randn(16)
+ref = lambda x, g: F.rms_norm(x, (16,), g, eps=1e-6)
+check("rmsnorm", rmsnorm(x, g), ref(x, g))
+check_grad("rmsnorm", rmsnorm, ref, x, g)
+
+#%% md
+## 4. Experiments — understand the invariances
+
+The papers justify these layers by what they're **invariant** to. Section 5 of the LayerNorm paper and §3 of the RMSNorm paper both discuss this. You can verify the claims numerically. Predict the results before you run the cell.
+
+For each of the three layers (with $\gamma=1, \beta=0$), is the output unchanged when you:
+- (a) scale the whole input by 5?
+- (b) add 3 to the whole input?
+- (c) change *another example in the batch*?
+
+#%% code
+x = torch.randn(8, 16)
+ones, zeros = torch.ones(16), torch.zeros(16)
+layers = {
+    "BatchNorm": lambda x: batchnorm_train(x, ones, zeros),
+    "LayerNorm": lambda x: layernorm(x, ones, zeros),
+    "RMSNorm":   lambda x: rmsnorm(x, ones),
+}
+x_other = x.clone(); x_other[1:] = torch.randn(7, 16)  # same example 0, different batch-mates
+for name, f in layers.items():
+    same = lambda a, b: torch.allclose(a[0], b[0], atol=1e-4)
+    print(f"{name:10s} scale-inv: {same(f(x), f(5 * x))!s:5}  "
+          f"shift-inv: {same(f(x), f(x + 3))!s:5}  "
+          f"batch-independent: {same(f(x), f(x_other))!s:5}")
+
+#%% md
+## Reflection
+1. For an image tensor `(N, C, H, W)`, BatchNorm2d computes statistics over which dims? LayerNorm in a ViT? GroupNorm with G groups?
+2. RMSNorm is scale-invariant but not shift-invariant. Why might dropping shift-invariance be acceptable in a transformer?
+3. What goes wrong with BatchNorm at batch size 1 in training mode? Try it.
+
+#%% md solution
+**Answers**
+1. BN2d: reduces over `(N, H, W)` and keeps `C`. ViT LayerNorm: reduces over the channel/embedding dim of each token. GroupNorm: reshape to `(N, G, C/G, H, W)` and reduce over `(C/G, H, W)`.
+2. The residual stream's mean isn't particularly meaningful, and the following linear layer (which has a bias) can absorb a shift. Empirically, quality matches LayerNorm at lower cost.
+3. With $m=1$, $x - \mu = 0$, so the output is just $\beta$ for every input. With `N=1` PyTorch raises an error for `BatchNorm1d` on `(1, D)` because the unbiased variance divides by $m-1 = 0$.

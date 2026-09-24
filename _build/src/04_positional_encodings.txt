@@ -1,0 +1,229 @@
+#%% md
+# 04 — Positional encodings: sinusoidal and RoPE
+
+**Papers**
+- Vaswani et al. (2017), *Attention Is All You Need*, §3.5
+- Su et al. (2021), *RoFormer: Enhanced Transformer with Rotary Position Embedding*, §3.2–3.4 (Eq. 14–16 and 34)
+
+**You will learn**
+- how to vectorize an equation defined "per element with index arithmetic" (`2i`, `2i+1`)
+- how to go from a *matrix* definition (a block-diagonal rotation) to an *efficient* elementwise form, and how to test one against the other
+- that the same math can have **different memory layouts** in different codebases (interleaved vs. half-split RoPE), and how to prove they're equivalent
+
+#%% code
+import math
+import torch
+import matplotlib.pyplot as plt
+from p2t import check, seed
+
+seed(0)
+
+#%% md
+## 1. Sinusoidal positional encoding
+
+$$PE_{(pos,\,2i)} = \sin\!\left(\frac{pos}{10000^{2i/d_{model}}}\right) \qquad PE_{(pos,\,2i+1)} = \cos\!\left(\frac{pos}{10000^{2i/d_{model}}}\right)$$
+
+**Decode it:** the output is a `(T, d_model)` table. $i$ indexes **pairs** of dimensions, so $i \in \{0, \dots, d/2 - 1\}$. Even columns get $\sin$ and odd columns get $\cos$, and both columns in a pair share a frequency.
+
+**Vectorizing index arithmetic:** build `pos` as a column `(T, 1)` and the frequencies as a row `(1, d/2)`. Broadcasting gives the `(T, d/2)` angle table. Then write into `pe[:, 0::2]` and `pe[:, 1::2]`.
+
+### Exercise 1
+
+#%% code
+def sinusoidal_pe(T, d, base=10000.0):
+    """-> (T, d)"""
+    ### BEGIN SOLUTION
+    pos = torch.arange(T, dtype=torch.float32)[:, None]            # (T, 1)
+    two_i = torch.arange(0, d, 2, dtype=torch.float32)[None, :]    # (1, d/2): the values 2i
+    angles = pos / base ** (two_i / d)                             # (T, d/2)
+    pe = torch.zeros(T, d)
+    pe[:, 0::2] = torch.sin(angles)
+    pe[:, 1::2] = torch.cos(angles)
+    return pe
+    ### END SOLUTION
+
+#%% code
+# Reference: the literal, loop-over-every-entry translation of the equation.
+def sinusoidal_pe_loops(T, d):
+    pe = torch.zeros(T, d)
+    for pos in range(T):
+        for i in range(d // 2):
+            pe[pos, 2 * i] = math.sin(pos / 10000 ** (2 * i / d))
+            pe[pos, 2 * i + 1] = math.cos(pos / 10000 ** (2 * i / d))
+    return pe
+
+check("sinusoidal_pe", sinusoidal_pe(50, 64), sinusoidal_pe_loops(50, 64))
+
+#%% code
+pe = sinusoidal_pe(128, 64)
+fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+ax[0].imshow(pe.T, aspect="auto", cmap="RdBu"); ax[0].set_xlabel("position"); ax[0].set_ylabel("dim")
+ax[0].set_title("PE table: low dims = high frequency")
+ax[1].imshow(pe @ pe.T, cmap="viridis"); ax[1].set_title("PE[p] · PE[q]: depends mostly on |p - q|")
+plt.show()
+
+#%% md
+## 2. RoPE, the matrix form
+
+RoFormer encodes position by **rotating** query and key vectors. For $d=2$ (Eq. 13), position $m$ rotates by angle $m\theta$. For general even $d$ (Eq. 15), the rotation is block-diagonal:
+
+$$R^d_{\Theta,m} = \begin{pmatrix} \cos m\theta_1 & -\sin m\theta_1 & & & \\ \sin m\theta_1 & \cos m\theta_1 & & & \\ & & \ddots & & \\ & & & \cos m\theta_{d/2} & -\sin m\theta_{d/2} \\ & & & \sin m\theta_{d/2} & \cos m\theta_{d/2}\end{pmatrix}, \quad \theta_i = 10000^{-2(i-1)/d},\ i \in [1, \dots, d/2]$$
+
+and $f(x, m) = R^d_{\Theta,m}\,x$ (column-vector convention).
+
+**Decode it:** the paper uses **1-indexed** $i$, so in 0-indexed code $\theta_i = 10000^{-2i/d}$ for $i = 0..d/2-1$. Block $i$ acts on dims $(2i, 2i+1)$, the adjacent pairs. This is the **interleaved** layout.
+
+### Exercise 2 — frequencies and the literal rotation matrix
+Build the full `(d, d)` matrix. It's wasteful ($O(d^2)$), but it's the equation as written, so it serves as the **reference** for the efficient version.
+
+#%% code
+def rope_freqs(d, base=10000.0):
+    """-> theta: (d/2,)"""
+    ### BEGIN SOLUTION
+    return base ** (-torch.arange(0, d, 2, dtype=torch.float32) / d)
+    ### END SOLUTION
+
+
+def rope_matrix(m, d, base=10000.0):
+    """-> R: (d, d), the block-diagonal rotation for position m."""
+    ### BEGIN SOLUTION
+    theta = rope_freqs(d, base)
+    R = torch.zeros(d, d)
+    for i in range(d // 2):
+        c, s = math.cos(m * theta[i]), math.sin(m * theta[i])
+        R[2 * i, 2 * i], R[2 * i, 2 * i + 1] = c, -s
+        R[2 * i + 1, 2 * i], R[2 * i + 1, 2 * i + 1] = s, c
+    return R
+    ### END SOLUTION
+
+#%% code
+check("rope_freqs", rope_freqs(8), torch.tensor([1.0, 10000 ** -0.25, 10000 ** -0.5, 10000 ** -0.75]))
+R = rope_matrix(5, 16)
+check("R is orthogonal (R Rᵀ = I)", R @ R.T, torch.eye(16), atol=1e-5)
+check("R_0 = I", rope_matrix(0, 16), torch.eye(16))
+check("R_m R_n = R_{m+n}", rope_matrix(3, 16) @ rope_matrix(4, 16), rope_matrix(7, 16), atol=1e-5)
+
+#%% md
+## 3. RoPE, the efficient form
+
+Because $R$ is sparse, Eq. 34 of the paper rewrites $R x$ as two elementwise products:
+$$R^d_{\Theta,m}x = \begin{pmatrix}x_1\\x_2\\x_3\\x_4\\\vdots\end{pmatrix}\odot\begin{pmatrix}\cos m\theta_1\\\cos m\theta_1\\\cos m\theta_2\\\cos m\theta_2\\\vdots\end{pmatrix} + \begin{pmatrix}-x_2\\x_1\\-x_4\\x_3\\\vdots\end{pmatrix}\odot\begin{pmatrix}\sin m\theta_1\\\sin m\theta_1\\\sin m\theta_2\\\sin m\theta_2\\\vdots\end{pmatrix}$$
+
+Check the first row against the matrix yourself: $x_1\cos m\theta_1 - x_2 \sin m\theta_1$ ✓.
+
+### Exercise 3 — `apply_rope` (interleaved, as in the paper)
+`x: (..., T, d)` holds one vector per position, and `positions: (T,)`. Steps:
+1. angles `(T, d/2)` = outer product of positions and $\theta$
+2. `cos`, `sin` repeated so each value covers its pair, giving `(T, d)` (`repeat_interleave`)
+3. `rotate_pairs(x)`: $(x_1, x_2, x_3, x_4, \dots) \to (-x_2, x_1, -x_4, x_3, \dots)$. Hint: view the last dim as `(d/2, 2)`.
+
+#%% code
+def rotate_pairs(x):
+    ### BEGIN SOLUTION
+    x_pairs = x.unflatten(-1, (-1, 2))                  # (..., d/2, 2)
+    x1, x2 = x_pairs[..., 0], x_pairs[..., 1]
+    return torch.stack([-x2, x1], dim=-1).flatten(-2)   # (..., d)
+    ### END SOLUTION
+
+
+def apply_rope(x, positions, base=10000.0):
+    """x: (..., T, d), positions: (T,) -> (..., T, d)"""
+    ### BEGIN SOLUTION
+    d = x.shape[-1]
+    angles = positions.float()[:, None] * rope_freqs(d, base)[None, :]  # (T, d/2)
+    cos = angles.cos().repeat_interleave(2, dim=-1)                     # (T, d)
+    sin = angles.sin().repeat_interleave(2, dim=-1)
+    return x * cos + rotate_pairs(x) * sin
+    ### END SOLUTION
+
+#%% code
+d, T = 16, 10
+x = torch.randn(2, 3, T, d)  # (B, H, T, d)
+pos = torch.arange(T)
+out = apply_rope(x, pos)
+expected = torch.stack([x[..., m, :] @ rope_matrix(m, d).T for m in range(T)], dim=-2)  # row-vector form of R x
+check("apply_rope == matrix form", out, expected, atol=1e-5)
+check("rope preserves norms", out.norm(dim=-1), x.norm(dim=-1))
+
+#%% md
+### Exercise 4 — the property RoPE was designed for
+
+The goal in §3.1 of the paper is that the attention score depends only on the **relative** position:
+$$\langle f(q, m), f(k, n)\rangle = g(q, k, m - n)$$
+Proof: $(R_m q)^\top (R_n k) = q^\top R_m^\top R_n k = q^\top R_{n-m} k$.
+Write a function that returns the RoPE'd score between `q` at position `m` and `k` at position `n`, then check the property numerically.
+
+#%% code
+def rope_score(q, k, m, n):
+    """q, k: (d,). Score between q at position m and k at position n."""
+    ### BEGIN SOLUTION
+    qm = apply_rope(q[None], torch.tensor([m]))[0]
+    kn = apply_rope(k[None], torch.tensor([n]))[0]
+    return (qm * kn).sum()
+    ### END SOLUTION
+
+#%% code
+q, k = torch.randn(64), torch.randn(64)
+check("score(5, 2) == score(105, 102)", rope_score(q, k, 5, 2), rope_score(q, k, 105, 102), atol=1e-4)
+check("score(0, 7) == score(40, 47)", rope_score(q, k, 0, 7), rope_score(q, k, 40, 47), atol=1e-4)
+print("but score(5,2) != score(2,5):", rope_score(q, k, 5, 2).item(), rope_score(q, k, 2, 5).item())
+
+#%% md
+## 4. Same math, different layout: "half-split" RoPE
+
+GPT-NeoX, and later the Hugging Face LLaMA implementation, pair dim $i$ with dim $i + d/2$ instead of $2i$ with $2i+1$:
+```python
+def rotate_half(x):
+    x1, x2 = x[..., : d//2], x[..., d//2 :]
+    return torch.cat([-x2, x1], dim=-1)
+# cos/sin are cat([freqs, freqs]) instead of repeat_interleave
+```
+This is **not numerically identical** to the paper for the same weights. It's the same rotation applied to a **permuted** set of dimensions. Because $W_Q, W_K$ are learned, either layout works, but loading checkpoints across the two conventions requires permuting weights. (This bug has shipped in real conversion scripts.)
+
+### Exercise 5 — implement half-split RoPE and prove the equivalence
+
+#%% code
+def apply_rope_half(x, positions, base=10000.0):
+    ### BEGIN SOLUTION
+    d = x.shape[-1]
+    angles = positions.float()[:, None] * rope_freqs(d, base)[None, :]  # (T, d/2)
+    cos = torch.cat([angles.cos(), angles.cos()], dim=-1)               # (T, d)
+    sin = torch.cat([angles.sin(), angles.sin()], dim=-1)
+    x1, x2 = x[..., : d // 2], x[..., d // 2 :]
+    return x * cos + torch.cat([-x2, x1], dim=-1) * sin
+    ### END SOLUTION
+
+#%% code
+d = 16
+# perm maps half-split layout -> interleaved layout: interleaved[2i] = half[i], interleaved[2i+1] = half[i + d/2]
+perm = torch.stack([torch.arange(d // 2), torch.arange(d // 2) + d // 2], dim=-1).flatten()
+x = torch.randn(T, d)
+check("half-split == interleaved up to a permutation",
+      apply_rope_half(x, pos)[..., perm], apply_rope(x[..., perm], pos), atol=1e-5)
+print("but not equal without permuting:", torch.allclose(apply_rope_half(x, pos), apply_rope(x, pos), atol=1e-4))
+
+#%% md
+## 5. Experiment — long-term decay (§3.4.3)
+
+The paper claims the RoPE score decays as relative distance grows. Plot `rope_score(q, k, 0, n)` for $q = k = \mathbf{1}$ as $n$ grows, and then try random $q, k$. Does the decay hold for arbitrary vectors, or only "on average"?
+
+#%% code
+d = 128
+ones = torch.ones(d)
+dist = range(0, 400)
+plt.plot(dist, [rope_score(ones, ones, 0, n).item() for n in dist], label="q = k = 1")
+q, k = torch.randn(d), torch.randn(d)
+plt.plot(dist, [rope_score(q, k, 0, n).item() for n in dist], alpha=0.6, label="random q, k")
+plt.xlabel("relative distance"); plt.ylabel("score"); plt.legend(); plt.show()
+
+#%% md
+## Reflection
+1. Why does RoPE rotate $q$ and $k$ but **not** $v$?
+2. Low-index dims rotate fast and high-index dims rotate slowly. Which dims carry "local" position information, and which carry "semantic" content?
+3. "RoPE scaling" / NTK-aware interpolation for longer context changes `base`. Based on your `rope_freqs`, what does increasing `base` do?
+
+#%% md solution
+**Answers**
+1. Position only needs to influence *which* tokens attend to which, and that's determined by the $q\cdot k$ score. Rotating $v$ would inject absolute position into the output content.
+2. Fast-rotating dims (large $\theta$) distinguish nearby positions, which is local information. Slow dims barely rotate over a context window, so they behave almost position-free and can carry semantic matching.
+3. It lowers every $\theta_i$ (except $\theta_0 = 1$), so each dim rotates more slowly and the positional pattern is stretched over a longer range.

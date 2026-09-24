@@ -1,0 +1,159 @@
+#%% md
+# 08 — LoRA: turning a paper equation into an `nn.Module`
+
+**Paper:** Hu et al. (2021), *LoRA: Low-Rank Adaptation of Large Language Models*, §4.1 (Eq. 3) and the initialization/scaling paragraph that follows it.
+
+Up to now you've written functions. Most paper implementations become **modules**: parameters, initialization, frozen vs. trainable state, and sometimes a "merge for inference" trick. The equation is short, and most of the work is in the surrounding text.
+
+**You will learn**
+- reading the *prose* around an equation (initialization and scaling live there)
+- implementing a module that wraps a frozen pretrained layer
+- verifying structural claims (rank, parameter count, zero-init) with tests
+
+#%% code
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from p2t import check, seed
+
+seed(0)
+
+#%% md
+## The equation and the prose around it
+
+Eq. 3:
+$$h = W_0 x + \Delta W x = W_0 x + BAx$$
+
+and the paragraph after it:
+> *$W_0 \in \mathbb{R}^{d\times k}$, $B \in \mathbb{R}^{d\times r}$, $A \in \mathbb{R}^{r\times k}$, and the rank $r \ll \min(d,k)$. During training, $W_0$ is frozen and does not receive gradient updates, while $A$ and $B$ contain trainable parameters. [...] We use a random Gaussian initialization for $A$ and zero for $B$, so $\Delta W = BA$ is zero at the beginning of training. We then scale $\Delta W x$ by $\frac{\alpha}{r}$, where $\alpha$ is a constant in $r$.*
+
+**Decode it:**
+| symbol | shape | role | code |
+|---|---|---|---|
+| $W_0$ | $(d, k)$ = (out, in) | frozen | `base.weight`, `requires_grad=False` |
+| $A$ | $(r, k)$ | trainable, Gaussian init | `nn.Parameter` |
+| $B$ | $(d, r)$ | trainable, **zero** init | `nn.Parameter` |
+| $\alpha$ | scalar | hyperparameter | scaling $= \alpha / r$ |
+
+The paper uses column vectors. With batched rows `x: (N, k)`: $BAx \to$ `x @ A.T @ B.T`. **Never form $BA$** during training. That would be a full $d\times k$ matrix, and avoiding it is the point of the method: `(x @ A.T)` is only `(N, r)`.
+
+### Exercise 1 — `LoRALinear`
+
+#%% code
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r: int, alpha: float):
+        super().__init__()
+        self.base = base
+        d, k = base.weight.shape  # (out, in)
+        self.r, self.scaling = r, alpha / r
+        ### BEGIN SOLUTION
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.A = nn.Parameter(torch.randn(r, k) / math.sqrt(k))  # Gaussian; scaled so the init is sensible
+        self.B = nn.Parameter(torch.zeros(d, r))
+        ### END SOLUTION
+
+    def forward(self, x):
+        ### BEGIN SOLUTION
+        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scaling
+        ### END SOLUTION
+
+    @torch.no_grad()
+    def merged(self) -> nn.Linear:
+        """Return a plain nn.Linear equivalent to this layer (W = W0 + scaling * B A), for zero-overhead inference."""
+        ### BEGIN SOLUTION
+        out = nn.Linear(self.base.in_features, self.base.out_features, bias=self.base.bias is not None)
+        out.weight.copy_(self.base.weight + self.scaling * self.B @ self.A)
+        if self.base.bias is not None:
+            out.bias.copy_(self.base.bias)
+        return out
+        ### END SOLUTION
+
+#%% code
+base = nn.Linear(64, 32)
+lora = LoRALinear(base, r=4, alpha=8)
+x = torch.randn(10, 64)
+
+check("output == base output at init (B = 0)", lora(x), base(x))
+trainable = {n for n, p in lora.named_parameters() if p.requires_grad}
+assert trainable == {"A", "B"}, f"only A and B should be trainable, got {trainable}"
+print("✅ only A and B are trainable")
+check("A shape", torch.tensor(lora.A.shape), torch.tensor([4, 64]))
+check("B shape", torch.tensor(lora.B.shape), torch.tensor([32, 4]))
+
+with torch.no_grad():
+    lora.B.normal_()  # pretend we trained it
+check("merged linear == LoRA forward", lora.merged()(x), lora(x), atol=1e-5)
+dW = lora.merged().weight - base.weight
+check("rank(ΔW) = r", torch.linalg.matrix_rank(dW), torch.tensor(4))
+
+#%% md
+### Exercise 2 — parameter count
+
+The paper's headline claim is a massive reduction in trainable parameters. Write a function that counts trainable vs. total parameters for a module, then compute the ratio for a GPT-3-sized projection ($d = k = 12288$) with $r = 4$.
+
+#%% code
+def count_params(module):
+    """-> (trainable, total)"""
+    ### BEGIN SOLUTION
+    total = sum(p.numel() for p in module.parameters())
+    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    return trainable, total
+    ### END SOLUTION
+
+#%% code
+check("count_params", torch.tensor(count_params(lora)), torch.tensor([4 * 64 + 32 * 4, 64 * 32 + 32 + 4 * 64 + 32 * 4]))
+d = k = 12288; r = 4
+print(f"full fine-tune: {d * k:,} params per matrix   LoRA r={r}: {r * (d + k):,}   ratio: {d * k / (r * (d + k)):.0f}x")
+
+#%% md
+## 2. Experiment — when does low rank suffice?
+
+LoRA's hypothesis (§4.1) is that the weight *update* needed for adaptation has low "intrinsic rank". To test it, build a frozen "pretrained" layer, create a target layer $W_0 + \Delta W^*$ where $\Delta W^*$ has a **known rank**, and fit it with LoRA at several ranks $r$.
+
+**Predict first:** if $\mathrm{rank}(\Delta W^*) = 8$, what happens to the final loss for $r = 2, 4, 8, 16$?
+
+### Exercise 3 — the training loop
+Fill in the loop: an optimizer over the **trainable** parameters only, and MSE between `lora(x)` and `target(x)`.
+
+#%% code
+def fit_lora(r, true_rank, steps=500, d=64, k=64, lr=1e-2):
+    torch.manual_seed(0)
+    base = nn.Linear(k, d)
+    target = nn.Linear(k, d)
+    with torch.no_grad():
+        target.weight.copy_(base.weight + torch.randn(d, true_rank) @ torch.randn(true_rank, k) / k)
+        target.bias.copy_(base.bias)
+    lora = LoRALinear(base, r=r, alpha=r)  # alpha = r  ->  scaling 1
+    losses = []
+    ### BEGIN SOLUTION
+    opt = torch.optim.Adam([p for p in lora.parameters() if p.requires_grad], lr=lr)
+    for _ in range(steps):
+        x = torch.randn(128, k)
+        loss = F.mse_loss(lora(x), target(x))
+        opt.zero_grad(); loss.backward(); opt.step()
+        losses.append(loss.item())
+    ### END SOLUTION
+    return losses
+
+#%% code
+for r in [2, 4, 8, 16]:
+    plt.semilogy(fit_lora(r, true_rank=8), label=f"r = {r}")
+plt.xlabel("step"); plt.ylabel("MSE"); plt.title("fitting a rank-8 update"); plt.legend(); plt.show()
+final = {r: fit_lora(r, true_rank=8)[-1] for r in [4, 8]}
+assert final[8] < final[4] / 10, "r >= true rank should fit far better than r < true rank"
+print("✅ r >= true rank fits; r < true rank plateaus")
+
+#%% md
+## Reflection
+1. Why zero-init $B$ rather than $A$? What would happen if *both* were zero?
+2. Why scale by $\alpha/r$ rather than just $\alpha$? (Hint: the paper says this "helps to reduce the need to retune hyperparameters when we vary $r$".)
+3. After `merged()`, what is the inference cost of LoRA compared to the base model? What do you lose by merging if you serve many adapters?
+
+#%% md solution
+**Answers**
+1. Either choice makes $\Delta W = 0$ at init. If both were zero, $\partial L/\partial A \propto B^\top(\cdot) = 0$ and $\partial L/\partial B \propto (\cdot)A^\top = 0$, so training never starts (a saddle point). With $A$ random, $B$ gets a non-zero gradient on the first step.
+2. With $A$ initialized at a fixed scale, $BAx$ grows with $r$ (it sums over $r$ terms). Dividing by $r$ keeps the update magnitude roughly constant as $r$ varies, so the learning rate transfers between ranks.
+3. Zero extra cost, since it's a single matmul. But each adapter then needs its own full copy of $W$. Unmerged, you can keep one base model in memory and swap or batch many small $(A, B)$ pairs.

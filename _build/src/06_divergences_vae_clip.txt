@@ -1,0 +1,204 @@
+#%% md
+# 06 — Probabilistic losses: KL divergence, the VAE, and CLIP's contrastive loss
+
+**Papers**
+- Kingma & Welling (2013), *Auto-Encoding Variational Bayes*, §2.4 (reparameterization) and Appendix B (Gaussian KL)
+- Radford et al. (2021), *Learning Transferable Visual Models From Natural Language Supervision* (CLIP), Figure 3 pseudocode
+- van den Oord et al. (2018), *Representation Learning with Contrastive Predictive Coding* (InfoNCE), Eq. 4
+
+**You will learn**
+- turning expectations and distributions into code: closed forms vs. Monte Carlo
+- the argument-order trap in `F.kl_div`
+- the reparameterization trick, and why it's needed for gradients
+- reading **paper pseudocode** (CLIP gives numpy-like code, not equations)
+
+#%% code
+import math
+import torch
+import torch.nn.functional as F
+from torch.distributions import Normal, kl_divergence
+import matplotlib.pyplot as plt
+from p2t import check, check_grad, seed
+
+seed(0)
+
+#%% md
+## 1. KL divergence between categorical distributions
+
+$$D_{\mathrm{KL}}(P\,\Vert\,Q) = \sum_x P(x)\log\frac{P(x)}{Q(x)}$$
+
+**Decode it:** KL is **asymmetric**, and $P$ is the distribution the expectation is taken under. In models, $P$ and $Q$ usually arrive as *logits*, so compute in log space with `log_softmax`, as in notebook 01.
+
+### Exercise 1 — KL from logits
+
+#%% code
+def kl_categorical(p_logits, q_logits):
+    """(..., K), (..., K) -> (...)   KL(P || Q)"""
+    ### BEGIN SOLUTION
+    log_p = F.log_softmax(p_logits, -1)
+    log_q = F.log_softmax(q_logits, -1)
+    return (log_p.exp() * (log_p - log_q)).sum(-1)
+    ### END SOLUTION
+
+#%% code
+p_logits, q_logits = torch.randn(5, 10), torch.randn(5, 10)
+# F.kl_div(input, target) computes KL(target || input) and expects `input` to be LOG-probs.
+# The argument order is the reverse of the math notation, which is a well-known trap.
+ref = F.kl_div(F.log_softmax(q_logits, -1), F.log_softmax(p_logits, -1), log_target=True, reduction="none").sum(-1)
+check("kl_categorical", kl_categorical(p_logits, q_logits), ref)
+check("KL(P||P) = 0", kl_categorical(p_logits, p_logits), torch.zeros(5))
+print("asymmetric:", kl_categorical(p_logits, q_logits)[0].item(), "vs", kl_categorical(q_logits, p_logits)[0].item())
+
+#%% md
+## 2. KL between diagonal Gaussians (closed form)
+
+For univariate Gaussians, which you sum over independent dimensions:
+$$D_{\mathrm{KL}}\big(\mathcal{N}(\mu_1,\sigma_1^2)\,\Vert\,\mathcal{N}(\mu_2,\sigma_2^2)\big) = \log\frac{\sigma_2}{\sigma_1} + \frac{\sigma_1^2 + (\mu_1-\mu_2)^2}{2\sigma_2^2} - \frac{1}{2}$$
+
+VAE encoders output **log-variance** $\log\sigma^2$ rather than $\sigma$, because it's unconstrained and so is a safe output for a linear layer. Rewrite the formula in terms of `logvar` before coding: $\log\frac{\sigma_2}{\sigma_1} = \frac{1}{2}(\text{logvar}_2 - \text{logvar}_1)$.
+
+The VAE paper's Appendix B gives the special case $Q = \mathcal{N}(0, I)$:
+$$-D_{\mathrm{KL}}\big(q(z|x)\,\Vert\,\mathcal{N}(0,I)\big) = \frac{1}{2}\sum_{j=1}^{J}\left(1 + \log\sigma_j^2 - \mu_j^2 - \sigma_j^2\right)$$
+Watch the sign: the paper writes the **negative** KL, since it's part of the ELBO being maximized.
+
+### Exercise 2
+
+#%% code
+def kl_diag_gaussians(mu1, logvar1, mu2, logvar2):
+    """all (..., J) -> (...), summed over J"""
+    ### BEGIN SOLUTION
+    kl = 0.5 * (logvar2 - logvar1) + (logvar1.exp() + (mu1 - mu2) ** 2) / (2 * logvar2.exp()) - 0.5
+    return kl.sum(-1)
+    ### END SOLUTION
+
+
+def vae_kl(mu, logvar):
+    """KL(N(mu, sigma^2) || N(0, I)) summed over the last dim. Use the Appendix B formula."""
+    ### BEGIN SOLUTION
+    return -0.5 * (1 + logvar - mu ** 2 - logvar.exp()).sum(-1)
+    ### END SOLUTION
+
+#%% code
+mu1, lv1, mu2, lv2 = torch.randn(4, 6), torch.randn(4, 6), torch.randn(4, 6), torch.randn(4, 6)
+ref = kl_divergence(Normal(mu1, (0.5 * lv1).exp()), Normal(mu2, (0.5 * lv2).exp())).sum(-1)
+check("kl_diag_gaussians", kl_diag_gaussians(mu1, lv1, mu2, lv2), ref)
+z = torch.zeros(4, 6)
+check("vae_kl == general formula with N(0, I)", vae_kl(mu1, lv1), kl_diag_gaussians(mu1, lv1, z, z))
+
+#%% md
+## 3. The reparameterization trick
+
+The ELBO needs $\mathbb{E}_{q_\phi(z|x)}[\log p_\theta(x|z)]$, and you'd estimate it by sampling $z$. **Sampling isn't differentiable** with respect to $\phi$ ($\mu$ and $\sigma$). The trick (§2.4) is to move the randomness into a parameter-free noise variable:
+$$z = \mu + \sigma\odot\epsilon, \qquad \epsilon\sim\mathcal{N}(0, I)$$
+Now $z$ is a deterministic, differentiable function of $\mu,\sigma$, and gradients flow through.
+
+### Exercise 3
+
+#%% code
+def reparameterize(mu, logvar):
+    ### BEGIN SOLUTION
+    std = torch.exp(0.5 * logvar)
+    return mu + std * torch.randn_like(std)
+    ### END SOLUTION
+
+#%% code
+seed(0)
+mu = torch.full((200_000, 2), 3.0, requires_grad=True)
+logvar = torch.full((200_000, 2), math.log(4.0), requires_grad=True)  # sigma = 2
+zs = reparameterize(mu, logvar)
+check("sample mean ≈ mu", zs.mean(0), torch.tensor([3.0, 3.0]), atol=0.02)
+check("sample std ≈ sigma", zs.std(0), torch.tensor([2.0, 2.0]), atol=0.02)
+zs.sum().backward()
+assert mu.grad is not None and logvar.grad is not None, "gradients must flow to mu and logvar"
+print("✅ gradients flow to mu and logvar")
+
+#%% md
+### Exercise 4 — closed form vs. Monte Carlo
+
+When there's no closed form (for most interesting distributions), papers estimate KL by sampling:
+$$D_{\mathrm{KL}}(q\Vert p) = \mathbb{E}_{z\sim q}\left[\log q(z) - \log p(z)\right] \approx \frac{1}{S}\sum_{s=1}^S \left[\log q(z_s) - \log p(z_s)\right]$$
+Implement the estimator using `Normal(...).log_prob` and check that it converges to your closed form. This is a good general way to test *any* closed-form derivation you do from a paper.
+
+#%% code
+def kl_monte_carlo(mu, logvar, n_samples):
+    """MC estimate of KL(N(mu, sigma^2) || N(0, I)) for 1-D mu, logvar of shape (J,)."""
+    ### BEGIN SOLUTION
+    q = Normal(mu, (0.5 * logvar).exp())
+    p = Normal(torch.zeros_like(mu), torch.ones_like(mu))
+    z = q.sample((n_samples,))                      # (S, J)
+    return (q.log_prob(z) - p.log_prob(z)).sum(-1).mean()
+    ### END SOLUTION
+
+#%% code
+seed(0)
+mu, lv = torch.tensor([0.5, -1.0, 2.0]), torch.tensor([0.1, -0.5, 0.3])
+true = vae_kl(mu, lv)
+ns = [10, 100, 1_000, 10_000, 100_000]
+ests = [kl_monte_carlo(mu, lv, n).item() for n in ns]
+plt.semilogx(ns, ests, "o-", label="MC estimate"); plt.axhline(true, c="k", ls="--", label="closed form")
+plt.xlabel("samples"); plt.ylabel("KL"); plt.legend(); plt.show()
+check("MC ≈ closed form", torch.tensor(ests[-1]), true, atol=0.02)
+
+#%% md
+## 4. CLIP / InfoNCE contrastive loss
+
+The CLIP paper gives **pseudocode** instead of an equation (Figure 3), which is common in modern papers:
+```
+# I_f, T_f = image/text features [n, d]
+I_e = l2_normalize(np.dot(I_f, W_i), axis=1)
+T_e = l2_normalize(np.dot(T_f, W_t), axis=1)
+logits = np.dot(I_e, T_e.T) * np.exp(t)
+labels = np.arange(n)
+loss_i = cross_entropy_loss(logits, labels, axis=0)
+loss_t = cross_entropy_loss(logits, labels, axis=1)
+loss   = (loss_i + loss_t)/2
+```
+**Decode it:** the $i$-th image matches the $i$-th text. Every other item in the batch is a negative. `axis=0` vs. `axis=1` means softmax over images vs. over texts, which is the **same as** applying CE to `logits` and to `logits.T`. $t$ is a *learned log-temperature*.
+
+In equation form, the per-row term is InfoNCE (CPC paper, Eq. 4):
+$$\mathcal{L}_i = -\log\frac{\exp(s_{ii}/\tau)}{\sum_j\exp(s_{ij}/\tau)}$$
+
+### Exercise 5 — CLIP loss (you receive the projected but *not yet normalized* embeddings)
+
+#%% code
+def clip_loss(img_emb, txt_emb, logit_scale):
+    """img_emb, txt_emb: (n, d); logit_scale: scalar tensor t (log of the inverse temperature)."""
+    ### BEGIN SOLUTION
+    I = img_emb / img_emb.norm(dim=-1, keepdim=True)
+    T = txt_emb / txt_emb.norm(dim=-1, keepdim=True)
+    logits = I @ T.T * logit_scale.exp()                  # (n, n); logits[i, j] = sim(image i, text j)
+    labels = torch.arange(len(logits))
+    return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+    ### END SOLUTION
+
+#%% code
+n, d = 8, 32
+img, txt = torch.randn(n, d), torch.randn(n, d)
+t = torch.tensor(math.log(1 / 0.07))  # CLIP's init: temperature 0.07
+
+# Reference: InfoNCE per row, literally, in both directions
+def info_nce_loops(a, b, scale):
+    a = a / a.norm(dim=-1, keepdim=True); b = b / b.norm(dim=-1, keepdim=True)
+    losses = []
+    for i in range(len(a)):
+        sims = torch.stack([(a[i] * b[j]).sum() * scale for j in range(len(b))])
+        losses.append(-(sims[i] - torch.logsumexp(sims, 0)))
+    return torch.stack(losses).mean()
+
+expected = (info_nce_loops(img, txt, t.exp()) + info_nce_loops(txt, img, t.exp())) / 2
+check("clip_loss", clip_loss(img, txt, t), expected)
+check("perfectly aligned & separated -> ~0 loss", clip_loss(torch.eye(n) * 5, torch.eye(n) * 5, torch.tensor(5.0)),
+      torch.tensor(0.0), atol=1e-3)
+print("random embeddings -> ≈ log(n) =", math.log(n), " got:", clip_loss(img, txt, torch.tensor(0.0)).item())
+
+#%% md
+## Reflection
+1. Why does CLIP L2-normalize before the dot product? What would the learned temperature do without normalization?
+2. "Forward KL" $D(P\Vert Q)$ vs. "reverse KL" $D(Q\Vert P)$: which one is mode-covering, which is mode-seeking, and which does the VAE's KL term use?
+3. Why does a bigger batch make the contrastive task harder, and why did CLIP use batch size 32,768?
+
+#%% md solution
+**Answers**
+1. Normalizing makes the logits cosine similarities bounded in $[-1, 1]$, so the scale is controlled *only* by the temperature. Without it, the model could inflate the logits by growing the embedding norms, and the temperature would be redundant or unstable.
+2. With $P$ the data/target: $D(P\Vert Q)$ is mode-covering, because $Q$ must put mass wherever $P$ does. $D(Q\Vert P)$ is mode-seeking. The VAE uses $D(q_\phi(z|x) \Vert p(z))$, where the *approximate* distribution comes first, which is the reverse-KL form.
+3. There are more negatives per positive (the softmax is over $n$ items), which makes the classification harder and the learning signal richer. The loss at random init is $\log n$.

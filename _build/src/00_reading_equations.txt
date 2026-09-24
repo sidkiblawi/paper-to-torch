@@ -1,0 +1,223 @@
+#%% md
+# 00 — How to read an equation and turn it into code
+
+Every later notebook uses the method in this one. Papers write math for humans: it's compact, uses column vectors, and never states the batch dimension. Code has to be explicit about every axis. Translating between the two is a skill you can learn, and it comes down to a fixed recipe.
+
+## The recipe
+
+1. **List every symbol.** For each one, decide whether it's an *input*, a *learned parameter*, or a *hyperparameter*. Papers often define symbols far from the equation, so search backwards for "where".
+2. **Write the shape next to each symbol.** Use letters: `B` batch, `T` sequence length, `D` model dim, `H` heads, and so on. In code, keep a `# (B, T, D)` comment on every line.
+3. **Sort the indices into free and summed.** Indices that appear on the left-hand side are *free* and become the output shape. Indices that appear only on the right are *summed*, which means a reduction (`sum`, `mean`, `@`, `einsum`).
+4. **Map each operator to a torch op.** The cheat sheet is below.
+5. **Translate literally first (Python loops are fine), then vectorize.** The loop version *is* the equation. The vectorized version is an optimization, and it needs a test against the loop version.
+6. **Test.** Compare against a reference (a torch built-in, or your own loop version), test known properties (for example, "rows sum to 1"), and try extreme inputs (large values, zeros, masks).
+
+## Notation cheat sheet
+
+| Paper | Meaning | torch |
+|---|---|---|
+| $x \in \mathbb{R}^d$ | vector with $d$ entries | shape `(d,)`, or `(B, d)` with a batch |
+| $W \in \mathbb{R}^{m \times n}$ | matrix | shape `(m, n)` |
+| $Wx$ (column-vector convention) | linear map | `x @ W.T` when rows of `x` are examples |
+| $x^\top y$, $\langle x, y\rangle$ | dot product | `(x * y).sum(-1)` |
+| $x \odot y$ | elementwise (Hadamard) product | `x * y` |
+| $\lVert x \rVert_2$ | L2 norm | `x.pow(2).sum(-1).sqrt()` or `x.norm(dim=-1)` |
+| $\sum_i$, $\prod_i$ | sum/product over an index | `.sum(dim)`, `.prod(dim)` |
+| $\frac{1}{N}\sum_i$ | mean | `.mean(dim)` |
+| $\mathbb{E}_{x\sim p}[f(x)]$ | expectation | sample from $p$, then `.mean()` (Monte Carlo) |
+| $\mathbb{1}[\text{cond}]$ | indicator | `(cond).float()` |
+| $[a; b]$ or $\mathrm{concat}(a,b)$ | concatenation | `torch.cat([a, b], dim)` |
+| $\sigma(x)$ | sigmoid (usually, so check the paper) | `torch.sigmoid` |
+| $\mathrm{diag}(v)$, $\mathrm{tr}(A)$ | diagonal matrix, trace | `torch.diag(v)`, `A.diagonal(dim1=-2, dim2=-1).sum(-1)` |
+| $\nabla_\theta \mathcal{L}$ | gradient | autograd: `loss.backward()` |
+| $\log$ | natural log (almost always) | `torch.log` |
+| $a \propto b$ | proportional: **a normalizing constant was dropped** | you have to add it back |
+| $:=$, $\triangleq$ | "is defined as" | |
+
+### The #1 gotcha: column vectors vs. rows of a batch
+Papers usually write $y = Wx + b$ with $x \in \mathbb{R}^{d_{in}}$ a **column** vector and $W \in \mathbb{R}^{d_{out}\times d_{in}}$.
+In code, a batch is a matrix whose **rows** are examples, `x: (B, d_in)`. Transposing both sides gives $y^\top = x^\top W^\top + b^\top$, so the code is `y = x @ W.T + b`.
+This is why `nn.Linear.weight` has shape `(out, in)`. Some papers (including *Attention Is All You Need*) use the **row** convention $xW$, so read the shapes they give.
+
+#%% code
+import math
+import torch
+import torch.nn.functional as F
+from p2t import check, check_grad, check_shape, seed
+
+seed(0)
+
+#%% md
+## Einsum: index notation you can execute
+
+`torch.einsum` takes index notation directly. Every index letter in the equation becomes a letter in the spec string. **Letters that don't appear after `->` are summed over.**
+
+$$C_{ik} = \sum_j A_{ij} B_{jk} \quad\Longleftrightarrow\quad \texttt{einsum("ij,jk->ik", A, B)}$$
+
+Once you've identified the free and summed indices (step 3 of the recipe), the einsum string follows directly.
+
+#%% md
+### Exercise 1 — matrix multiply, three ways
+$C_{ik} = \sum_j A_{ij} B_{jk}$
+
+Write it (a) with explicit Python loops, which is the literal translation, and (b) with einsum. Don't use `@` or `matmul`.
+
+#%% code
+def matmul_loops(A, B):
+    """A: (I, J), B: (J, K) -> C: (I, K). Use python for-loops over i, k, j."""
+    I, J = A.shape
+    J2, K = B.shape
+    assert J == J2
+    C = torch.zeros(I, K)
+    ### BEGIN SOLUTION
+    for i in range(I):
+        for k in range(K):
+            for j in range(J):
+                C[i, k] += A[i, j] * B[j, k]
+    ### END SOLUTION
+    return C
+
+
+def matmul_einsum(A, B):
+    ### BEGIN SOLUTION
+    return torch.einsum("ij,jk->ik", A, B)
+    ### END SOLUTION
+
+#%% code
+A, B = torch.randn(4, 5), torch.randn(5, 3)
+check("matmul_loops", matmul_loops(A, B), A @ B)
+check("matmul_einsum", matmul_einsum(A, B), A @ B)
+
+#%% md
+### Exercise 2 — a linear layer, from paper convention to batch convention
+The paper says $y = Wx + b$ with $W \in \mathbb{R}^{d_{out}\times d_{in}}$, $x\in\mathbb{R}^{d_{in}}$.
+Your input is a **batch** `x: (B, d_in)`. Implement it without `F.linear`.
+
+#%% code
+def linear(x, W, b):
+    """x: (B, d_in), W: (d_out, d_in), b: (d_out,) -> (B, d_out)"""
+    ### BEGIN SOLUTION
+    return x @ W.T + b  # (B, d_in) @ (d_in, d_out) -> (B, d_out); b broadcasts over B
+    ### END SOLUTION
+
+#%% code
+x, W, b = torch.randn(8, 5), torch.randn(3, 5), torch.randn(3)
+check("linear", linear(x, W, b), F.linear(x, W, b))
+
+#%% md
+### Exercise 3 — a batched bilinear form
+Bilinear scores show up in older attention variants and in contrastive heads:
+$$s = x^\top M y, \qquad x\in\mathbb{R}^{d_1},\ M\in\mathbb{R}^{d_1\times d_2},\ y\in\mathbb{R}^{d_2}$$
+Given batches `x: (B, d1)` and `y: (B, d2)`, compute one score per batch element, `s: (B,)`.
+
+**Work it out on paper first:** in index form, $s_b = \sum_i\sum_j x_{bi} M_{ij} y_{bj}$. Which index is free, and which are summed?
+
+#%% code
+def bilinear(x, M, y):
+    """x: (B, d1), M: (d1, d2), y: (B, d2) -> (B,)"""
+    ### BEGIN SOLUTION
+    return torch.einsum("bi,ij,bj->b", x, M, y)
+    ### END SOLUTION
+
+#%% code
+x, M, y = torch.randn(6, 4), torch.randn(4, 3), torch.randn(6, 3)
+expected = torch.stack([x[i] @ M @ y[i] for i in range(6)])  # the literal loop version
+check("bilinear", bilinear(x, M, y), expected)
+
+#%% md
+### Exercise 4 — pairwise squared distances (broadcasting vs. algebra)
+$$D_{ij} = \lVert x_i - y_j \rVert_2^2 = \sum_d (x_{id} - y_{jd})^2, \qquad x: (N, D),\ y: (M, D)$$
+
+**(a) Broadcasting.** Insert singleton dims so `x` becomes `(N, 1, D)` and `y` becomes `(1, M, D)`. Subtracting them broadcasts to `(N, M, D)`, and you then reduce over `D`.
+
+**(b) Expanding the square.** $\lVert x_i - y_j\rVert^2 = \lVert x_i\rVert^2 + \lVert y_j\rVert^2 - 2\,x_i^\top y_j$. The last term is a single matmul. This version never materializes `(N, M, D)`, which matters when D is large. Rewriting an equation with algebra before coding it is a common way to make an implementation cheaper.
+
+#%% code
+def pdist2_broadcast(x, y):
+    """x: (N, D), y: (M, D) -> (N, M)"""
+    ### BEGIN SOLUTION
+    return (x[:, None, :] - y[None, :, :]).pow(2).sum(-1)
+    ### END SOLUTION
+
+
+def pdist2_expand(x, y):
+    """Same thing using ||x||^2 + ||y||^2 - 2 x.y  (no (N, M, D) intermediate)."""
+    ### BEGIN SOLUTION
+    x2 = x.pow(2).sum(-1, keepdim=True)   # (N, 1)
+    y2 = y.pow(2).sum(-1)[None, :]        # (1, M)
+    return x2 + y2 - 2 * x @ y.T          # (N, M)
+    ### END SOLUTION
+
+#%% code
+x, y = torch.randn(7, 16), torch.randn(5, 16)
+check("pdist2_broadcast", pdist2_broadcast(x, y), torch.cdist(x, y) ** 2)
+check("pdist2_expand", pdist2_expand(x, y), torch.cdist(x, y) ** 2, atol=1e-4)
+
+#%% md
+### Exercise 5 — the core of attention in einsum
+With batch `b`, head `h`, query position `i`, key position `j`, and feature `d`:
+$$S_{bhij} = \sum_d Q_{bhid}\,K_{bhjd}$$
+Write the einsum, then check it against the matmul form `Q @ K.transpose(-2, -1)`.
+
+#%% code
+def attn_scores(Q, K):
+    """Q: (B, H, Tq, D), K: (B, H, Tk, D) -> (B, H, Tq, Tk)"""
+    ### BEGIN SOLUTION
+    return torch.einsum("bhid,bhjd->bhij", Q, K)
+    ### END SOLUTION
+
+#%% code
+Q, K = torch.randn(2, 3, 5, 8), torch.randn(2, 3, 7, 8)
+check("attn_scores", attn_scores(Q, K), Q @ K.transpose(-2, -1))
+
+#%% md
+### Exercise 6 — indicators and masked means
+You'll see this pattern constantly (padding masks, loss masks, "only count valid tokens"):
+$$\bar{x} = \frac{\sum_i \mathbb{1}[m_i]\, x_i}{\sum_i \mathbb{1}[m_i]}$$
+Implement a masked mean over a given dim, where `mask` is boolean and `True` means "count this entry". Don't index with the mask (`x[mask]`), because that flattens the tensor and loses the batch structure. Multiply by the mask instead.
+
+#%% code
+def masked_mean(x, mask, dim):
+    """x: any shape, mask: bool, same shape as x. Mean over `dim` counting only mask==True."""
+    ### BEGIN SOLUTION
+    m = mask.to(x.dtype)
+    return (x * m).sum(dim) / m.sum(dim).clamp_min(1)
+    ### END SOLUTION
+
+#%% code
+x = torch.randn(3, 6)
+mask = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1], [1, 0, 0, 0, 0, 0]]).bool()
+expected = torch.stack([x[i][mask[i]].mean() for i in range(3)])
+check("masked_mean", masked_mean(x, mask, dim=1), expected)
+
+#%% md
+### Exercise 7 — an expectation, by Monte Carlo
+When a paper writes $\mathbb{E}_{x\sim p}[f(x)]$, the code usually samples from $p$ and averages.
+Estimate $\mathbb{E}_{x \sim \mathcal{N}(0, 1)}[x^2]$ (the true value is 1) and $\mathbb{E}_{x \sim \mathcal{N}(0, 1)}[\mathbb{1}[x > 1]]$ (the true value is $1 - \Phi(1) \approx 0.1587$).
+
+#%% code
+def mc_estimates(n):
+    """Return (estimate of E[x^2], estimate of P(x > 1)) using n samples from N(0,1)."""
+    ### BEGIN SOLUTION
+    x = torch.randn(n)
+    return x.pow(2).mean(), (x > 1).float().mean()
+    ### END SOLUTION
+
+#%% code
+seed(0)
+e_x2, p_gt1 = mc_estimates(1_000_000)
+check("E[x^2] ≈ 1", e_x2, torch.tensor(1.0), atol=1e-2)
+check("P(x>1) ≈ 0.1587", p_gt1, torch.tensor(0.15866), atol=2e-3)
+
+#%% md
+## Reflection
+Answer these in your own words before moving on.
+1. In Exercise 4, how much memory does the broadcast version use for N = M = 10,000 and D = 1,024 in float32? How much does the expanded version use?
+2. The expanded form in Exercise 4 can give slightly *negative* distances. Why, and how would you fix it?
+3. For Exercise 3, write the einsum string for the case where `M` is also batched, i.e. `M: (B, d1, d2)`.
+
+#%% md solution
+**Answers**
+1. Broadcast: $10^4 \cdot 10^4 \cdot 1024 \cdot 4$ bytes ≈ **410 GB**. Expanded: the `(N, M)` result is $10^8 \cdot 4$ bytes ≈ **400 MB**, plus the inputs.
+2. Floating-point cancellation: when $x_i \approx y_j$, you subtract two large, nearly equal numbers. Fix it with `.clamp_min(0)` (and take the `sqrt` only after clamping).
+3. `"bi,bij,bj->b"`.

@@ -1,0 +1,275 @@
+#%% md
+# 09 — Diffusion (DDPM): from equations and algorithm boxes to a working model
+
+**Paper:** Ho, Jain & Abbeel (2020), *Denoising Diffusion Probabilistic Models*: Eq. 2, 4, 6–7, 11, and Algorithms 1 & 2.
+
+This notebook is a full paper implementation. By the end you'll have trained a small diffusion model on 2D data, built from nothing but the paper's equations.
+
+**You will learn**
+- **1-indexed math vs. 0-indexed code** (the paper's $t = 1..T$)
+- the per-example scalar broadcasting pattern: `a[t].view(B, 1, 1, ...)`
+- verifying a closed-form claim (Eq. 4) by simulating the process it summarizes (Eq. 2)
+- using an **oracle** to test a formula: if you know the right answer, the sampling step must reproduce the posterior mean
+
+#%% code
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from p2t import check, seed
+
+seed(0)
+
+#%% md
+## 1. The noise schedule
+
+The forward process adds Gaussian noise over $T$ steps with variances $\beta_1, \dots, \beta_T$ (§4: linear from $10^{-4}$ to $0.02$, $T = 1000$). The paper defines:
+$$\alpha_t := 1 - \beta_t \qquad \bar\alpha_t := \prod_{s=1}^t \alpha_s$$
+
+**Indexing convention for this notebook:** arrays are 0-indexed, so `betas[i]` holds $\beta_{i+1}$ and `alpha_bars[i]` holds $\bar\alpha_{i+1}$. Code timestep `t` = paper timestep `t+1`. Off-by-one errors here are the most common DDPM bug.
+
+### Exercise 1
+
+#%% code
+def make_schedule(T=1000, beta_start=1e-4, beta_end=0.02, dtype=torch.float32):
+    """-> dict with 'betas', 'alphas', 'alpha_bars', each (T,) of the given dtype"""
+    ### BEGIN SOLUTION
+    betas = torch.linspace(beta_start, beta_end, T, dtype=dtype)
+    alphas = 1 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    return {"betas": betas, "alphas": alphas, "alpha_bars": alpha_bars}
+    ### END SOLUTION
+
+#%% code
+S = make_schedule()
+ab_loop = [1.0]
+for a in S["alphas"]:
+    ab_loop.append(ab_loop[-1] * a.item())
+check("alpha_bars == cumulative product", S["alpha_bars"], torch.tensor(ab_loop[1:]), atol=1e-6)
+print(f"alpha_bar at t=T: {S['alpha_bars'][-1]:.2e}  (≈ 0 means x_T is pure noise)")
+plt.plot(S["alpha_bars"].sqrt(), label="√ᾱ_t  (signal coefficient)")
+plt.plot((1 - S["alpha_bars"]).sqrt(), label="√(1-ᾱ_t)  (noise coefficient)")
+plt.xlabel("t"); plt.legend(); plt.show()
+
+#%% md
+## 2. The forward process, in closed form
+
+Eq. 2 defines one step, $q(x_t|x_{t-1}) = \mathcal{N}(x_t;\ \sqrt{1-\beta_t}\,x_{t-1},\ \beta_t I)$. Eq. 4 is the property that makes training cheap: you can jump straight to any $t$:
+$$q(x_t | x_0) = \mathcal{N}\!\left(x_t;\ \sqrt{\bar\alpha_t}\,x_0,\ (1-\bar\alpha_t)I\right) \quad\Longrightarrow\quad x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$$
+
+**The broadcasting pattern:** in a batch, **each example has its own** $t$. So `alpha_bars[t]` is `(B,)`, and you need it as `(B, 1, 1, ...)` to multiply `x0: (B, C, H, W)` or `(B, D)`. Write a helper for this, since you'll use it in every diffusion codebase you touch.
+
+### Exercise 2
+
+#%% code
+def extract(a, t, x_shape):
+    """a: (T,), t: (B,) long -> a[t] reshaped to (B, 1, 1, ...) with len(x_shape) dims total."""
+    ### BEGIN SOLUTION
+    return a[t].view(-1, *([1] * (len(x_shape) - 1)))
+    ### END SOLUTION
+
+
+def q_sample(x0, t, noise, alpha_bars):
+    """x0: (B, ...), t: (B,) long, noise: like x0 -> x_t: like x0"""
+    ### BEGIN SOLUTION
+    ab = extract(alpha_bars, t, x0.shape)
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+    ### END SOLUTION
+
+#%% code
+x0 = torch.randn(4, 3, 8, 8)
+noise = torch.randn_like(x0)
+t = torch.tensor([0, 10, 500, 999])
+out = q_sample(x0, t, noise, S["alpha_bars"])
+for i in range(4):
+    ab = S["alpha_bars"][t[i]]
+    check(f"q_sample example {i} (t={t[i].item()})", out[i], ab.sqrt() * x0[i] + (1 - ab).sqrt() * noise[i])
+check("extract shape", torch.tensor(extract(S["alpha_bars"], t, x0.shape).shape), torch.tensor([4, 1, 1, 1]))
+
+#%% md
+### Exercise 3 — check that Eq. 4 really follows from Eq. 2
+
+Simulate the *step-by-step* chain (Eq. 2), $x_t = \sqrt{1-\beta_t}\,x_{t-1} + \sqrt{\beta_t}\,\epsilon_t$, for many independent samples starting from the same $x_0$. The empirical mean and std of $x_t$ should match $\sqrt{\bar\alpha_t}x_0$ and $\sqrt{1-\bar\alpha_t}$.
+
+#%% code
+def q_sample_iterative(x0, t, betas, n_samples):
+    """x0: scalar tensor; t: int (code index). Run steps 0..t inclusive. -> (n_samples,) samples of x_t"""
+    ### BEGIN SOLUTION
+    x = x0.expand(n_samples).clone()
+    for s in range(t + 1):
+        x = (1 - betas[s]).sqrt() * x + betas[s].sqrt() * torch.randn(n_samples)
+    return x
+    ### END SOLUTION
+
+#%% code
+seed(0)
+x0_val = torch.tensor(2.0)
+for t_ in [9, 99, 499]:
+    xs = q_sample_iterative(x0_val, t_, S["betas"], 100_000)
+    ab = S["alpha_bars"][t_]
+    check(f"t={t_}: mean", xs.mean(), ab.sqrt() * x0_val, atol=0.02)
+    check(f"t={t_}: std", xs.std(), (1 - ab).sqrt(), atol=0.02)
+
+#%% md
+## 3. The training objective (Algorithm 1)
+
+```
+repeat
+    x_0 ~ q(x_0)
+    t ~ Uniform({1, ..., T})
+    ε ~ N(0, I)
+    Take gradient descent step on  ∇_θ ‖ε − ε_θ(√ᾱ_t x_0 + √(1−ᾱ_t) ε, t)‖²
+until converged
+```
+
+**Decode it:** the network $\epsilon_\theta(x_t, t)$ **predicts the noise** that was added. The loss is plain MSE. (The paper derives this "simplified" loss $L_\text{simple}$ in Eq. 14 by dropping a weighting term from the true ELBO.)
+
+For testability, `t` and `noise` are passed in rather than sampled inside the function.
+
+### Exercise 4
+
+#%% code
+def ddpm_loss(model, x0, t, noise, alpha_bars):
+    """model(x_t, t) -> predicted noise. Returns scalar MSE."""
+    ### BEGIN SOLUTION
+    x_t = q_sample(x0, t, noise, alpha_bars)
+    return F.mse_loss(model(x_t, t), noise)
+    ### END SOLUTION
+
+#%% code
+dummy = lambda x, t: 0.5 * x  # any function of (x_t, t) will do for a test
+x0, t, noise = torch.randn(16, 2), torch.randint(0, 1000, (16,)), torch.randn(16, 2)
+ab = S["alpha_bars"][t][:, None]
+xt = ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+check("ddpm_loss", ddpm_loss(dummy, x0, t, noise, S["alpha_bars"]), ((noise - 0.5 * xt) ** 2).mean())
+
+#%% md
+## 4. The reverse step (Algorithm 2) and why it's correct
+
+The true posterior of the forward process (Eq. 6–7) is Gaussian with mean
+$$\tilde\mu_t(x_t, x_0) = \frac{\sqrt{\bar\alpha_{t-1}}\,\beta_t}{1-\bar\alpha_t}x_0 + \frac{\sqrt{\alpha_t}\,(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}x_t$$
+At sampling time we don't know $x_0$, so the paper rewrites $x_0$ in terms of the predicted noise (Eq. 11), which gives the update in Algorithm 2:
+$$x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\left(x_t - \frac{1-\alpha_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon_\theta(x_t, t)\right) + \sigma_t z, \qquad z\sim\mathcal{N}(0,I)\text{ if } t>1\text{, else } z = 0$$
+with $\sigma_t^2 = \beta_t$ (§3.2).
+
+**Decode it:** $\bar\alpha_{t-1}$ at paper-$t = 1$ is $\bar\alpha_0$, the empty product, which is **1**. In code, that's `alpha_bar_prev = 1.0` when `t == 0`.
+
+### Exercise 5 — posterior mean (Eq. 7) and the sampling step (Algorithm 2)
+
+#%% code
+def posterior_mean(x0, xt, t, sched):
+    """Eq. 7. t: int (code index)."""
+    ### BEGIN SOLUTION
+    beta, alpha, ab = sched["betas"][t], sched["alphas"][t], sched["alpha_bars"][t]
+    ab_prev = sched["alpha_bars"][t - 1] if t > 0 else torch.ones_like(ab)
+    return (ab_prev.sqrt() * beta / (1 - ab)) * x0 + (alpha.sqrt() * (1 - ab_prev) / (1 - ab)) * xt
+    ### END SOLUTION
+
+
+def p_sample_step(model, xt, t, sched, z):
+    """Algorithm 2, one step. t: int (code index). z: noise like xt (ignored at t == 0)."""
+    ### BEGIN SOLUTION
+    beta, alpha, ab = sched["betas"][t], sched["alphas"][t], sched["alpha_bars"][t]
+    t_batch = torch.full((xt.shape[0],), t, dtype=torch.long)
+    eps = model(xt, t_batch)
+    mean = (xt - (1 - alpha) / (1 - ab).sqrt() * eps) / alpha.sqrt()
+    return mean + (beta.sqrt() * z if t > 0 else 0.0)
+    ### END SOLUTION
+
+#%% md
+**The oracle test.** Suppose you *know* $x_0$. Then the perfect noise predictor is $\epsilon^* = (x_t - \sqrt{\bar\alpha_t}x_0)/\sqrt{1-\bar\alpha_t}$ (Eq. 4 solved for $\epsilon$). Given that oracle and $z = 0$, Algorithm 2 must return **exactly** $\tilde\mu_t(x_t, x_0)$. If your two functions agree, you've implemented both equations correctly and also confirmed the paper's derivation between them.
+
+**A precision detail:** this test runs in **float64**. At $t=1$, $1-\bar\alpha_1 = \beta_1 = 10^{-4}$, and computing it as `1 - (1 - 1e-4)` in float32 loses about 3 of the ~7 significant digits (catastrophic cancellation). The original DDPM code computes its schedule in float64 for this reason. Try the test with `dtype=torch.float32` and you'll see it fail only at small $t$.
+
+#%% code
+S64 = make_schedule(dtype=torch.float64)
+x0 = torch.randn(8, 2, dtype=torch.float64)
+for t_ in [0, 1, 50, 999]:
+    tb = torch.full((8,), t_)
+    xt = q_sample(x0, tb, torch.randn_like(x0), S64["alpha_bars"])
+    ab_t = lambda tt, shape: extract(S64["alpha_bars"], tt, shape)
+    oracle = lambda x, tt: (x - ab_t(tt, x.shape).sqrt() * x0) / (1 - ab_t(tt, x.shape)).sqrt()
+    check(f"Algorithm 2 with oracle == Eq. 7 posterior mean (t={t_})",
+          p_sample_step(oracle, xt, t_, S64, torch.zeros_like(xt)), posterior_mean(x0, xt, t_, S64), atol=1e-8)
+
+#%% md
+## 5. Put it together: train a diffusion model on 2D data
+
+The data is 8 Gaussian blobs on a circle. The model is an MLP that takes $(x_t, \text{embed}(t))$. The training loop is Algorithm 1 using your functions. **Your job is the sampling loop** (Algorithm 2, looped from $t = T$ down to $1$).
+
+For speed, this uses $T = 200$ with a steeper schedule so that $\bar\alpha_T$ still ends near 0.
+
+#%% code
+def sample_data(n):
+    angles = torch.randint(0, 8, (n,)) * (2 * math.pi / 8)
+    centers = torch.stack([angles.cos(), angles.sin()], -1) * 2.0
+    return centers + 0.1 * torch.randn(n, 2)
+
+
+class EpsModel(nn.Module):
+    def __init__(self, T, hidden=128):
+        super().__init__()
+        self.T = T
+        self.net = nn.Sequential(nn.Linear(2 + 32, hidden), nn.SiLU(), nn.Linear(hidden, hidden), nn.SiLU(),
+                                 nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 2))
+
+    def forward(self, x, t):
+        freqs = torch.exp(-math.log(1000) * torch.arange(16) / 16)       # sinusoidal time embedding (notebook 04)
+        ang = (t.float() / self.T * 1000)[:, None] * freqs[None]
+        return self.net(torch.cat([x, ang.sin(), ang.cos()], -1))
+
+
+T = 200
+S2 = make_schedule(T, 1e-4, 0.05)
+seed(0)
+model = EpsModel(T)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+losses = []
+for step in range(3000):
+    x0 = sample_data(512)
+    t = torch.randint(0, T, (512,))
+    loss = ddpm_loss(model, x0, t, torch.randn_like(x0), S2["alpha_bars"])
+    opt.zero_grad(); loss.backward(); opt.step()
+    losses.append(loss.item())
+plt.plot(losses); plt.yscale("log"); plt.title("training loss"); plt.show()
+
+#%% md
+### Exercise 6 — the sampling loop
+
+#%% code
+@torch.no_grad()
+def sample(model, n, sched):
+    """Start from x_T ~ N(0, I) and apply p_sample_step for t = T-1 ... 0 (code indices). Return x_0."""
+    ### BEGIN SOLUTION
+    x = torch.randn(n, 2)
+    for t in reversed(range(len(sched["betas"]))):
+        x = p_sample_step(model, x, t, sched, torch.randn_like(x))
+    return x
+    ### END SOLUTION
+
+#%% code
+seed(1)
+samples = sample(model, 2000, S2)
+real = sample_data(2000)
+fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+ax[0].scatter(*real.T, s=2); ax[0].set_title("data")
+ax[1].scatter(*samples.T, s=2, c="C1"); ax[1].set_title("DDPM samples")
+for a in ax: a.set_xlim(-3, 3); a.set_ylim(-3, 3); a.set_aspect("equal")
+plt.show()
+radius = samples.norm(dim=-1)
+print(f"median sample radius: {radius.median():.2f} (data: 2.00)")
+assert (radius.median() - 2.0).abs() < 0.2, "samples should concentrate near the circle of radius 2"
+print("✅ your DDPM generates the data distribution")
+
+#%% md
+## Reflection
+1. Why does Algorithm 1 sample a random $t$ per example instead of looping over all $t$ for each $x_0$?
+2. What would happen if you forgot the `if t > 0` and added noise at the final step?
+3. Many later papers predict $x_0$ or $v = \sqrt{\bar\alpha_t}\epsilon - \sqrt{1-\bar\alpha_t}x_0$ instead of $\epsilon$. Using Eq. 4, write $x_0$ in terms of $x_t$ and $\epsilon$. Why is it useful to be able to convert between these parameterizations?
+
+#%% md solution
+**Answers**
+1. Eq. 4 makes every $t$ independently sampleable in $O(1)$, so a random $t$ gives an unbiased Monte Carlo estimate of the sum over $t$ in the loss at the cost of one forward pass per example.
+2. The final sample gets extra Gaussian noise with std $\sqrt{\beta_1}$ (≈ 0.01 in this notebook). That's small here, but it's systematic blur and is wrong per the paper.
+3. $x_0 = (x_t - \sqrt{1-\bar\alpha_t}\,\epsilon)/\sqrt{\bar\alpha_t}$. The parameterizations are related by these linear maps, so you can train with one and sample (or apply guidance) with another. Implementations switch between them constantly, as in DDIM and classifier-free guidance.

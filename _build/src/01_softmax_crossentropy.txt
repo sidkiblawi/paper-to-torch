@@ -1,0 +1,206 @@
+#%% md
+# 01 — Softmax, log-sum-exp, and cross-entropy
+
+**Why this matters:** softmax appears in nearly every model (classification heads, attention, LM outputs, contrastive losses). The equation is one line, but a literal translation overflows. This notebook covers the most important lesson in numerical code: **a correct equation can still be a broken implementation.**
+
+**You will learn**
+- the max-subtraction trick, and why it's mathematically free
+- why frameworks take *logits* and not probabilities
+- the gradient of softmax cross-entropy ($p - y$), checked with autograd
+- label smoothing (Szegedy et al., 2016, *Rethinking the Inception Architecture*, §7)
+
+**Rule for this notebook:** don't use `torch.softmax`, `F.log_softmax`, `torch.logsumexp`, or `F.cross_entropy` in your solutions. They're only used as references in the tests.
+
+#%% code
+import math
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from p2t import check, check_grad, seed
+
+seed(0)
+
+#%% md
+## 1. Softmax
+
+$$\mathrm{softmax}(z)_i = \frac{e^{z_i}}{\sum_{j=1}^{K} e^{z_j}}$$
+
+**Decode it:** $z \in \mathbb{R}^K$ are logits. $i$ is free (the output is a vector over $i$), and $j$ is summed. In code, `z` has shape `(..., K)`, and the sum runs over the **last** dim.
+
+### Exercise 1a — naive softmax (translate literally)
+
+#%% code
+def softmax_naive(z, dim=-1):
+    ### BEGIN SOLUTION
+    e = torch.exp(z)
+    return e / e.sum(dim, keepdim=True)
+    ### END SOLUTION
+
+#%% code
+z = torch.randn(4, 10)
+check("softmax_naive", softmax_naive(z), torch.softmax(z, -1))
+
+print("but look what happens with big logits:", softmax_naive(torch.tensor([1000.0, 1000.0])))
+
+#%% md
+`exp(1000)` is `inf` in float32 (the max is about $e^{88.7}$), and `inf / inf = nan`.
+
+### The fix is free
+For any constant $c$:
+$$\frac{e^{z_i - c}}{\sum_j e^{z_j - c}} = \frac{e^{-c}\,e^{z_i}}{e^{-c}\sum_j e^{z_j}} = \mathrm{softmax}(z)_i$$
+So softmax is **shift-invariant**. Choose $c = \max_j z_j$. Then the largest exponent is $e^0 = 1$, which can't overflow, and the denominator is $\ge 1$, so it can't be 0.
+
+### Exercise 1b — stable softmax
+
+#%% code
+def softmax(z, dim=-1):
+    ### BEGIN SOLUTION
+    z = z - z.amax(dim, keepdim=True)
+    e = torch.exp(z)
+    return e / e.sum(dim, keepdim=True)
+    ### END SOLUTION
+
+#%% code
+check("softmax", softmax(z), torch.softmax(z, -1))
+check("softmax dim=0", softmax(z, dim=0), torch.softmax(z, 0))
+check("softmax big logits", softmax(torch.tensor([1000.0, 1000.0])), torch.tensor([0.5, 0.5]))
+check("softmax very negative", softmax(torch.tensor([-1000.0, 0.0])), torch.tensor([0.0, 1.0]))
+check_grad("softmax", softmax, lambda z: torch.softmax(z, -1), z)
+
+#%% md
+## 2. Log-sum-exp and log-softmax
+
+In practice we almost always want $\log p$ rather than $p$ (for losses, likelihoods, and KL). Taking the log of `softmax(z)` loses precision: a tiny probability underflows to 0, and $\log 0 = -\infty$. Work in log space from the start:
+
+$$\log \mathrm{softmax}(z)_i = z_i - \underbrace{\log\sum_j e^{z_j}}_{\mathrm{LSE}(z)}$$
+
+with the same trick applied to the log-sum-exp:
+$$\mathrm{LSE}(z) = m + \log\sum_j e^{z_j - m},\quad m = \max_j z_j$$
+
+### Exercise 2 — `logsumexp` and `log_softmax`
+
+#%% code
+def logsumexp(z, dim=-1, keepdim=False):
+    ### BEGIN SOLUTION
+    m = z.amax(dim, keepdim=True)
+    out = m + torch.log(torch.exp(z - m).sum(dim, keepdim=True))
+    return out if keepdim else out.squeeze(dim)
+    ### END SOLUTION
+
+
+def log_softmax(z, dim=-1):
+    ### BEGIN SOLUTION
+    return z - logsumexp(z, dim, keepdim=True)
+    ### END SOLUTION
+
+#%% code
+check("logsumexp", logsumexp(z), torch.logsumexp(z, -1))
+check("logsumexp keepdim", logsumexp(z, 0, keepdim=True), torch.logsumexp(z, 0, keepdim=True))
+check("logsumexp big", logsumexp(torch.tensor([1000.0, 1000.0])), torch.tensor(1000 + math.log(2)))
+check("log_softmax", log_softmax(z), F.log_softmax(z, -1))
+check("log_softmax extreme", log_softmax(torch.tensor([0.0, -200.0])), torch.tensor([0.0, -200.0]))
+check_grad("log_softmax", log_softmax, lambda z: F.log_softmax(z, -1), z)
+
+print("naive log(softmax) on the extreme case:", torch.log(softmax(torch.tensor([0.0, -200.0]))))
+
+#%% md
+## 3. Cross-entropy
+
+For $N$ examples with logits $z_n \in \mathbb{R}^K$ and integer labels $y_n \in \{0..K-1\}$:
+$$\mathcal{L} = -\frac{1}{N}\sum_{n=1}^N \log p_{n, y_n}, \qquad p_n = \mathrm{softmax}(z_n)$$
+
+**Decode it:** $p_{n,y_n}$ means "row $n$, column $y_n$". Selecting one column per row is `gather` (or advanced indexing `logp[torch.arange(N), y]`).
+
+This is why `F.cross_entropy` takes **logits**. It fuses the log-softmax and the gather, so it never forms $p$ and never takes $\log p$ directly.
+
+### Exercise 3 — cross-entropy from logits
+
+#%% code
+def cross_entropy(logits, y):
+    """logits: (N, K), y: (N,) int64 -> scalar"""
+    ### BEGIN SOLUTION
+    logp = log_softmax(logits, -1)                       # (N, K)
+    return -logp.gather(1, y[:, None]).squeeze(1).mean()  # pick column y_n in each row n
+    ### END SOLUTION
+
+#%% code
+logits, y = torch.randn(16, 10), torch.randint(0, 10, (16,))
+check("cross_entropy", cross_entropy(logits, y), F.cross_entropy(logits, y))
+check_grad("cross_entropy", lambda l: cross_entropy(l, y), lambda l: F.cross_entropy(l, y), logits)
+
+#%% md
+### Exercise 4 — the gradient of cross-entropy is $p - \text{onehot}(y)$
+
+For a single example, $\frac{\partial \mathcal{L}}{\partial z_k} = p_k - \mathbb{1}[k = y]$. It's worth deriving this by hand once:
+$\mathcal{L} = -z_y + \mathrm{LSE}(z)$, and $\partial\,\mathrm{LSE}/\partial z_k = \mathrm{softmax}(z)_k$.
+
+Implement the gradient **analytically** (no autograd) for the batch-mean loss. Remember the $\frac{1}{N}$.
+
+#%% code
+def cross_entropy_grad(logits, y):
+    """Return dL/dlogits, shape (N, K), for L = mean cross-entropy."""
+    ### BEGIN SOLUTION
+    N, K = logits.shape
+    p = softmax(logits, -1)
+    onehot = F.one_hot(y, K).to(logits.dtype)
+    return (p - onehot) / N
+    ### END SOLUTION
+
+#%% code
+l = logits.clone().requires_grad_()
+F.cross_entropy(l, y).backward()
+check("analytic CE grad == autograd", cross_entropy_grad(logits, y), l.grad)
+
+#%% md
+**What it means:** the gradient pushes the correct logit up by $(1-p_y)$ and every wrong logit down by its probability. Once the model is confident and correct, $p \approx \text{onehot}$ and the gradient vanishes. Label smoothing (next) prevents it from ever reaching exactly zero.
+
+## 4. Label smoothing
+
+Szegedy et al. (2016), §7 replaces the one-hot target with
+$$q'(k) = (1-\varepsilon)\,\delta_{k,y} + \frac{\varepsilon}{K}$$
+and minimizes $H(q', p) = -\sum_k q'(k)\log p(k)$.
+
+### Exercise 5 — cross-entropy with label smoothing
+Expand the sum first. You'll find it's a weighted combination of the usual CE term and the *mean of all log-probs*, so you don't need to build the `(N, K)` target explicitly (though you can).
+
+#%% code
+def cross_entropy_smooth(logits, y, eps):
+    ### BEGIN SOLUTION
+    logp = log_softmax(logits, -1)
+    nll = -logp.gather(1, y[:, None]).squeeze(1)  # -log p_y
+    uniform = -logp.mean(-1)                       # -(1/K) sum_k log p_k
+    return ((1 - eps) * nll + eps * uniform).mean()
+    ### END SOLUTION
+
+#%% code
+for eps in [0.0, 0.1, 0.3]:
+    check(f"label smoothing eps={eps}", cross_entropy_smooth(logits, y, eps),
+          F.cross_entropy(logits, y, label_smoothing=eps))
+
+#%% md
+## 5. Experiment — temperature
+
+Many papers write $\mathrm{softmax}(z/\tau)$ (distillation, sampling, contrastive losses). Run the cell and interpret the plot: what happens as $\tau\to 0$? As $\tau \to \infty$?
+
+#%% code
+z = torch.tensor([2.0, 1.0, 0.5, 0.0, -1.0])
+taus = torch.logspace(-2, 2, 100)
+entropies = []
+for t in taus:
+    p = softmax(z / t)
+    entropies.append(-(p * torch.log(p.clamp_min(1e-30))).sum().item())
+plt.semilogx(taus, entropies)
+plt.axhline(math.log(len(z)), ls="--", c="gray", label="log K (uniform)")
+plt.xlabel("temperature τ"); plt.ylabel("entropy (nats)"); plt.legend(); plt.show()
+
+#%% md
+## Reflection
+1. Why is `amax` subtraction safe for the *gradient* too? Should you `detach()` the max? Try it both ways.
+2. If you only had `softmax` probabilities (not logits), how would you compute CE safely? What's lost?
+3. Why does `F.cross_entropy` accept class-probability targets as well as integer targets? Which paper-style losses need that?
+
+#%% md solution
+**Answers**
+1. Because softmax is shift-invariant, the gradient through $m$ is exactly zero mathematically: $\sum_i \partial\,\mathrm{softmax}_i/\partial m = 0$. Detaching doesn't change the result and saves a little compute. Many implementations do it.
+2. `-(p.clamp_min(tiny)).log()`. You lose all precision for probabilities below ~1e-38 (float32), and the gradient path through softmax→log is less stable than the fused one.
+3. Soft targets are used for knowledge distillation (Hinton et al. 2015), mixup/cutmix, and label smoothing. They're all $H(q, p)$ with a non-one-hot $q$.

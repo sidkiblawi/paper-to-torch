@@ -1,0 +1,203 @@
+#%% md
+# 07 — Optimizers from their update equations: SGD+momentum, Adam, AdamW
+
+**Papers**
+- Sutskever et al. (2013), *On the importance of initialization and momentum in deep learning*, Eq. 1–2
+- Kingma & Ba (2014), *Adam: A Method for Stochastic Optimization*, Algorithm 1
+- Loshchilov & Hutter (2017), *Decoupled Weight Decay Regularization* (AdamW), Algorithm 2
+
+**You will learn**
+- turning *algorithm boxes* (pseudocode with time subscripts $t$) into stateful code
+- that "the same algorithm" can have different but equivalent parameterizations, and how to tell whether two versions really match
+- why L2 regularization ≠ weight decay for Adam, and how to demonstrate it
+
+The tests run your optimizer and `torch.optim` side by side on the same small network and require identical parameters after 50 steps.
+
+#%% code
+import math
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from p2t import check, seed
+
+seed(0)
+
+
+def make_problem():
+    """A small MLP regression problem that is identical every time it's called."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 16), nn.Tanh(), nn.Linear(16, 1))
+    X, y = torch.randn(64, 4), torch.randn(64, 1)
+    return model, X, y
+
+
+def train(opt_factory, steps=50):
+    model, X, y = make_problem()
+    opt = opt_factory(model.parameters())
+    for _ in range(steps):
+        for p in model.parameters():
+            p.grad = None
+        loss = ((model(X) - y) ** 2).mean()
+        loss.backward()
+        opt.step()
+    return torch.cat([p.detach().flatten() for p in model.parameters()])
+
+#%% md
+## 1. SGD with momentum
+
+Sutskever et al. write classical momentum as
+$$v_{t+1} = \mu v_t - \varepsilon\nabla f(\theta_t) \qquad \theta_{t+1} = \theta_t + v_{t+1}$$
+
+PyTorch implements a **different but equivalent** form (see the `torch.optim.SGD` docs note):
+$$b_t = \mu\, b_{t-1} + g_t \qquad \theta_t = \theta_{t-1} - \gamma\, b_t$$
+With a constant learning rate these produce identical trajectories ($v = -\gamma b$). With a changing learning rate they differ. When a paper's algorithm and a library's docs disagree, work out whether the difference matters for your use.
+
+Implement the **PyTorch form**. Note that PyTorch initializes $b_1 = g_1$ on the first step, which is the same as $b_0 = 0$.
+
+### Exercise 1
+
+#%% code
+class MySGD:
+    def __init__(self, params, lr, momentum=0.0):
+        self.params = list(params)
+        self.lr, self.mu = lr, momentum
+        self.buf = [torch.zeros_like(p) for p in self.params]
+
+    @torch.no_grad()
+    def step(self):
+        for p, b in zip(self.params, self.buf):
+            g = p.grad
+            ### BEGIN SOLUTION
+            b.mul_(self.mu).add_(g)   # b = mu * b + g   (in place, so the state persists)
+            p.sub_(self.lr * b)
+            ### END SOLUTION
+
+#%% code
+check("SGD (no momentum)", train(lambda ps: MySGD(ps, lr=0.1)), train(lambda ps: torch.optim.SGD(ps, lr=0.1)))
+check("SGD + momentum", train(lambda ps: MySGD(ps, lr=0.05, momentum=0.9)),
+      train(lambda ps: torch.optim.SGD(ps, lr=0.05, momentum=0.9)))
+
+#%% md
+**Note the in-place updates.** Optimizer state must persist across `step()` calls. Writing `b = self.mu * b + g` would rebind a local name and silently discard the state. This is one of the most common bugs when implementing an algorithm box.
+
+## 2. Adam
+
+Algorithm 1 of the paper (every operation on vectors is elementwise):
+
+$$\begin{aligned}
+g_t &= \nabla_\theta f_t(\theta_{t-1}) \\
+m_t &= \beta_1 m_{t-1} + (1-\beta_1)\,g_t \\
+v_t &= \beta_2 v_{t-1} + (1-\beta_2)\,g_t^2 \\
+\hat m_t &= m_t / (1-\beta_1^t) \\
+\hat v_t &= v_t / (1-\beta_2^t) \\
+\theta_t &= \theta_{t-1} - \alpha\,\hat m_t / (\sqrt{\hat v_t} + \epsilon)
+\end{aligned}$$
+
+**Decode it:** $g_t^2$ is elementwise. $\beta_1^t$ is $\beta_1$ **raised to the power t** (not a time-indexed $\beta$), so you need a step counter $t$ starting at 1. $m_0 = v_0 = 0$.
+
+### Exercise 2
+
+#%% code
+class MyAdam:
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
+        self.params = list(params)
+        self.lr, (self.b1, self.b2), self.eps = lr, betas, eps
+        self.m = [torch.zeros_like(p) for p in self.params]
+        self.v = [torch.zeros_like(p) for p in self.params]
+        self.t = 0
+
+    @torch.no_grad()
+    def step(self):
+        self.t += 1
+        for p, m, v in zip(self.params, self.m, self.v):
+            g = p.grad
+            ### BEGIN SOLUTION
+            m.mul_(self.b1).add_((1 - self.b1) * g)
+            v.mul_(self.b2).add_((1 - self.b2) * g * g)
+            m_hat = m / (1 - self.b1 ** self.t)
+            v_hat = v / (1 - self.b2 ** self.t)
+            p.sub_(self.lr * m_hat / (v_hat.sqrt() + self.eps))
+            ### END SOLUTION
+
+#%% code
+check("Adam", train(lambda ps: MyAdam(ps, lr=1e-2)), train(lambda ps: torch.optim.Adam(ps, lr=1e-2)), atol=1e-5)
+check("Adam (other betas)", train(lambda ps: MyAdam(ps, lr=3e-3, betas=(0.8, 0.95))),
+      train(lambda ps: torch.optim.Adam(ps, lr=3e-3, betas=(0.8, 0.95))), atol=1e-5)
+
+#%% md
+### Experiment — what does bias correction do?
+
+$m_0 = 0$, so early on $m_t$ is biased toward 0. §3 of the paper derives $\mathbb{E}[m_t] \approx \mathbb{E}[g](1-\beta_1^t)$, which is why dividing by $(1-\beta_1^t)$ fixes it. Below, feed a **constant** gradient $g = 1$ and compare $m_t$ and $\hat m_t$ (and likewise for $v$). What would the effective step size be at $t=1$ *without* correction, with the default betas?
+
+#%% code
+b1, b2 = 0.9, 0.999
+m = v = 0.0; ms, mhats, steps_raw, steps_corr = [], [], [], []
+for t in range(1, 201):
+    m = b1 * m + (1 - b1) * 1.0; v = b2 * v + (1 - b2) * 1.0
+    ms.append(m); mhats.append(m / (1 - b1 ** t))
+    steps_raw.append(m / math.sqrt(v)); steps_corr.append((m / (1 - b1 ** t)) / math.sqrt(v / (1 - b2 ** t)))
+fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+ax[0].plot(ms, label="m_t"); ax[0].plot(mhats, label="m̂_t"); ax[0].legend(); ax[0].set_title("first moment, g ≡ 1")
+ax[1].plot(steps_raw, label="m/√v (no correction)"); ax[1].plot(steps_corr, label="m̂/√v̂")
+ax[1].legend(); ax[1].set_title("update size / lr"); plt.show()
+
+#%% md
+## 3. AdamW: L2 regularization ≠ weight decay
+
+**L2 regularization** adds $\frac{\lambda}{2}\lVert\theta\rVert^2$ to the loss, so $g_t \leftarrow g_t + \lambda\theta$. In Adam, that extra term is then *divided by* $\sqrt{\hat v_t}$, so weights with large gradients get *less* regularization. That's what `torch.optim.Adam(weight_decay=...)` does.
+
+**Decoupled weight decay** (Loshchilov & Hutter, Algorithm 2, line 12) applies the decay directly to the parameters, outside the adaptive rescaling:
+$$\theta_t = \theta_{t-1} - \eta_t\left(\alpha\,\hat m_t/(\sqrt{\hat v_t}+\epsilon) + \lambda\,\theta_{t-1}\right)$$
+
+**Library detail:** in the paper, $\eta_t$ is a *schedule multiplier* separate from $\alpha$. PyTorch's `AdamW` has no separate $\eta$ and multiplies the decay by `lr`: it performs `p *= 1 - lr * weight_decay` first, then the Adam step. So PyTorch's `weight_decay=0.01` means $\eta\lambda = \text{lr}\cdot 0.01$. Implement the PyTorch version.
+
+### Exercise 3 — AdamW (subclass your Adam)
+
+#%% code
+class MyAdamW(MyAdam):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
+        super().__init__(params, lr, betas, eps)
+        self.wd = weight_decay
+
+    @torch.no_grad()
+    def step(self):
+        ### BEGIN SOLUTION
+        for p in self.params:
+            p.mul_(1 - self.lr * self.wd)  # decoupled decay uses θ_{t-1}, before the Adam update
+        super().step()
+        ### END SOLUTION
+
+#%% code
+check("AdamW", train(lambda ps: MyAdamW(ps, lr=1e-2, weight_decay=0.1)),
+      train(lambda ps: torch.optim.AdamW(ps, lr=1e-2, weight_decay=0.1)), atol=1e-5)
+
+#%% md
+### Exercise 4 — show that they differ
+Using `torch.optim` only, train with `Adam(weight_decay=wd)` and with `AdamW(weight_decay=wd)` for the same `lr`. Return the final parameter vectors so you can compare them. Then try to find a single `wd` value for Adam-L2 that matches AdamW. Is it possible? Why not?
+
+#%% code
+def compare_l2_vs_decoupled(lr=1e-2, wd=0.1, steps=200):
+    ### BEGIN SOLUTION
+    p_l2 = train(lambda ps: torch.optim.Adam(ps, lr=lr, weight_decay=wd), steps)
+    p_dec = train(lambda ps: torch.optim.AdamW(ps, lr=lr, weight_decay=wd), steps)
+    return p_l2, p_dec
+    ### END SOLUTION
+
+#%% code
+p_l2, p_dec = compare_l2_vs_decoupled()
+print(f"||θ|| with Adam+L2: {p_l2.norm():.3f}   with AdamW: {p_dec.norm():.3f}")
+print(f"max |difference|: {(p_l2 - p_dec).abs().max():.3f}")
+assert not torch.allclose(p_l2, p_dec, atol=1e-3), "they should differ!"
+print("✅ L2 regularization and decoupled weight decay produce different solutions")
+
+#%% md
+## Reflection
+1. Why must `step()` use in-place ops (`mul_`, `add_`) on the state, and why is it wrapped in `@torch.no_grad()`?
+2. Adam's update magnitude is roughly bounded by $\alpha$ regardless of the gradient scale. Show this from the equations. What happens to the effective step for a parameter whose gradient is always 0?
+3. Adam stores `m` and `v` per parameter. For a 7B-parameter model in fp32, how much memory is the optimizer state?
+
+#%% md solution
+**Answers**
+1. The state has to persist across calls, and rebinding a name loses it. `no_grad` stops autograd from recording the parameter updates into the graph (and in-place ops on leaf tensors that require grad would otherwise raise an error).
+2. If $g$ is consistent, $\hat m \approx g$ and $\sqrt{\hat v} \approx |g|$, so the step is $\approx \alpha\cdot\mathrm{sign}(g)$. It's scale-invariant. For $g \equiv 0$, $m = v = 0$, so the step is $0/(0 + \epsilon) = 0$, and only the weight decay moves the parameter.
+3. $2 \times 7\times10^9 \times 4$ bytes = **56 GB**, on top of 28 GB of weights and 28 GB of gradients. This is why 8-bit optimizers and ZeRO sharding exist.

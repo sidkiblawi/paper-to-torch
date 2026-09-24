@@ -1,0 +1,184 @@
+#%% md
+# 05 — Activations and feed-forward blocks: GELU, SiLU, SwiGLU
+
+**Papers**
+- Hendrycks & Gimpel (2016), *Gaussian Error Linear Units (GELUs)*, §2
+- Ramachandran, Zoph & Le (2017), *Searching for Activation Functions* (Swish)
+- Vaswani et al. (2017), Eq. 2 (the position-wise FFN)
+- Shazeer (2020), *GLU Variants Improve Transformer*, Eq. 5–6
+
+**You will learn**
+- translating special functions ($\Phi$, $\mathrm{erf}$) and their approximations
+- **row-vector convention** papers ($xW$ instead of $Wx$)
+- reading a paper's *parameter-count* argument and turning it into a hyperparameter
+
+**Rule:** don't use `F.gelu`, `F.silu`, or `torch.nn.GELU` in your solutions. `torch.erf`, `torch.tanh`, and `torch.sigmoid` are allowed.
+
+#%% code
+import math
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from p2t import check, check_grad, seed
+
+seed(0)
+
+#%% md
+## 1. GELU
+
+$$\mathrm{GELU}(x) = x\,P(X \le x) = x\,\Phi(x) = x\cdot\tfrac{1}{2}\left[1 + \mathrm{erf}(x/\sqrt{2})\right]$$
+
+**Decode it:** $\Phi$ is the standard normal CDF, and $X \sim \mathcal{N}(0,1)$. The paper motivates GELU as "multiply the input by a stochastic 0/1 mask whose keep-probability grows with $x$", and GELU is the *expected value* of that. PyTorch has no `Phi`, so express it with `erf` as shown.
+
+The paper also gives an approximation (it was faster in 2016 and is what GPT-2 used):
+$$\mathrm{GELU}(x) \approx 0.5\,x\left(1 + \tanh\!\left[\sqrt{2/\pi}\,\left(x + 0.044715\,x^3\right)\right]\right)$$
+
+### Exercise 1
+
+#%% code
+def gelu(x):
+    ### BEGIN SOLUTION
+    return x * 0.5 * (1 + torch.erf(x / math.sqrt(2)))
+    ### END SOLUTION
+
+
+def gelu_tanh(x):
+    ### BEGIN SOLUTION
+    return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x ** 3)))
+    ### END SOLUTION
+
+#%% code
+x = torch.linspace(-6, 6, 1001)
+check("gelu", gelu(x), F.gelu(x))
+check("gelu_tanh", gelu_tanh(x), F.gelu(x, approximate="tanh"))
+check_grad("gelu", gelu, F.gelu, x)
+print(f"max |exact - tanh approx| = {(gelu(x) - gelu_tanh(x)).abs().max():.2e}")
+
+#%% md
+### Exercise 2 — verify the paper's *interpretation* by Monte Carlo
+
+"GELU is the expected value of $x \cdot m$ where $m \sim \mathrm{Bernoulli}(\Phi(x))$." Check this by sampling: for each $x$, draw many Bernoulli masks and average $x\cdot m$. A useful way to understand a paper's definition is to simulate the story it tells.
+
+#%% code
+def gelu_monte_carlo(x, n_samples=20_000):
+    """x: (N,) -> (N,), the MC estimate of E[x * m], m ~ Bernoulli(Phi(x))"""
+    ### BEGIN SOLUTION
+    phi = 0.5 * (1 + torch.erf(x / math.sqrt(2)))                    # (N,)
+    m = torch.bernoulli(phi[None, :].expand(n_samples, -1))          # (S, N)
+    return (x[None, :] * m).mean(0)
+    ### END SOLUTION
+
+#%% code
+seed(0)
+xs = torch.linspace(-3, 3, 13)
+check("MC estimate ≈ GELU", gelu_monte_carlo(xs), gelu(xs), atol=0.05)
+
+#%% md
+## 2. SiLU / Swish
+
+$$\mathrm{Swish}_\beta(x) = x\cdot\sigma(\beta x), \qquad \mathrm{SiLU}(x) = \mathrm{Swish}_1(x)$$
+
+Compare it to GELU: GELU gates by $\Phi(x)$, and SiLU gates by $\sigma(x)$. Both are a *smooth* $x\cdot\text{gate}(x)$.
+
+#%% code
+def swish(x, beta=1.0):
+    ### BEGIN SOLUTION
+    return x * torch.sigmoid(beta * x)
+    ### END SOLUTION
+
+#%% code
+check("silu", swish(x), F.silu(x))
+fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+xg = x.clone().requires_grad_()
+for name, f in [("ReLU", torch.relu), ("GELU", gelu), ("SiLU", swish), ("Swish β=4", lambda t: swish(t, 4.0))]:
+    y = f(xg)
+    (g,) = torch.autograd.grad(y.sum(), xg)
+    ax[0].plot(x, y.detach(), label=name); ax[1].plot(x, g, label=name)
+ax[0].set_title("activation"); ax[1].set_title("derivative (via autograd)")
+ax[0].set_ylim(-1, 3); ax[0].legend(); plt.show()
+
+#%% md
+Notice that GELU and SiLU are **non-monotonic**: they dip below 0 near $x\approx-1$. Their derivatives also exceed 1 slightly. Neither is visible from the equation, but both show up immediately in a plot.
+
+## 3. The Transformer FFN (row-vector convention)
+
+Vaswani et al., Eq. 2:
+$$\mathrm{FFN}(x) = \max(0,\ xW_1 + b_1)\,W_2 + b_2$$
+
+**Decode it:** this paper writes $xW$, so $x$ is a **row** and $W_1 \in \mathbb{R}^{d_{model}\times d_{ff}}$ is `(in, out)`. That's the opposite of `nn.Linear.weight`. "Position-wise" means the same FFN is applied to each token independently, so for `x: (B, T, D)` you just matmul over the last dim.
+
+## 4. SwiGLU FFN
+
+Shazeer (2020), Eq. 5–6 (biases omitted, as in the paper):
+$$\mathrm{FFN}_{\mathrm{SwiGLU}}(x, W, V, W_2) = \left(\mathrm{Swish}_1(xW) \odot xV\right)W_2$$
+
+**Decode it:** there are two parallel input projections. $xW$ goes through the activation (the "gate"), and $xV$ stays linear (the "value"). They're multiplied elementwise and then projected down. Shapes: $W, V \in \mathbb{R}^{d\times d_{ff}}$, $W_2 \in \mathbb{R}^{d_{ff}\times d}$.
+
+### Exercise 3 — both FFNs
+
+#%% code
+def ffn_relu(x, W1, b1, W2, b2):
+    """x: (..., d), W1: (d, dff), W2: (dff, d)  (paper's row-vector layout)"""
+    ### BEGIN SOLUTION
+    return torch.relu(x @ W1 + b1) @ W2 + b2
+    ### END SOLUTION
+
+
+def ffn_swiglu(x, W, V, W2):
+    """x: (..., d), W/V: (d, dff), W2: (dff, d)"""
+    ### BEGIN SOLUTION
+    return (swish(x @ W) * (x @ V)) @ W2
+    ### END SOLUTION
+
+#%% code
+d, dff = 8, 20
+x = torch.randn(2, 5, d)
+W1, b1, W2, b2 = torch.randn(d, dff), torch.randn(dff), torch.randn(dff, d), torch.randn(d)
+W, V = torch.randn(d, dff), torch.randn(d, dff)
+
+# References: one token at a time, with explicit sums (the most literal reading of the equations)
+def per_token(fn):
+    out = torch.zeros_like(x)
+    for b in range(x.shape[0]):
+        for t in range(x.shape[1]):
+            out[b, t] = fn(x[b, t])
+    return out
+
+relu_ref = per_token(lambda v: torch.stack([sum(max(0.0, (v @ W1[:, j] + b1[j]).item()) * W2[j, k].item()
+                                                 for j in range(dff)) + b2[k] for k in range(d)]))
+swiglu_ref = per_token(lambda v: torch.stack([sum(((v @ W[:, j]) * torch.sigmoid(v @ W[:, j]) * (v @ V[:, j])) * W2[j, k]
+                                                   for j in range(dff)) for k in range(d)]))
+check("ffn_relu", ffn_relu(x, W1, b1, W2, b2), relu_ref, atol=1e-4)
+check("ffn_swiglu", ffn_swiglu(x, W, V, W2), swiglu_ref, atol=1e-4)
+
+#%% md
+### Exercise 4 — the parameter-matching argument
+
+Shazeer's §3 says: *"To keep the number of parameters and the amount of computation constant, we reduce the number of hidden units $d_{ff}$ (the second dimension of $W$ and $V$ and the first dimension of $W_2$) by a factor of $\frac{2}{3}$ when comparing these layers to the original two-matrix version."*
+
+The standard FFN uses $d_{ff} = 4d$ with two matrices. Derive the SwiGLU hidden size with the same parameter count, then round it **up** to a multiple of `multiple_of` for hardware efficiency. This is exactly how LLaMA sizes its FFN.
+
+#%% code
+def swiglu_hidden_dim(d, multiple_of=256):
+    ### BEGIN SOLUTION
+    # 2 * d * 4d = 3 * d * h  =>  h = 8d/3
+    h = int(8 * d / 3)
+    return multiple_of * math.ceil(h / multiple_of)
+    ### END SOLUTION
+
+#%% code
+check("LLaMA-7B FFN size (d=4096)", swiglu_hidden_dim(4096), 11008)
+d = 4096; h = swiglu_hidden_dim(d)
+print(f"params: standard FFN {2 * d * 4 * d / 1e6:.1f}M   SwiGLU {3 * d * h / 1e6:.1f}M")
+
+#%% md
+## Reflection
+1. Why might a *smooth* activation (GELU/SiLU) train better than ReLU? Look at your derivative plot near 0.
+2. SwiGLU has no nonlinearity on the $xV$ branch. Is the block still nonlinear in $x$? What kind of function is it (hint: degree)?
+3. If you saw $\mathrm{FFN}(x) = W_2\,\sigma(W_1 x)$ in a paper, what shape would $W_1$ have and how would you write it for `x: (B, T, d)`?
+
+#%% md solution
+**Answers**
+1. ReLU's derivative jumps from 0 to 1, and it's exactly 0 for all negative inputs ("dead" units). GELU and SiLU have continuous derivatives and small non-zero gradients for moderately negative inputs.
+2. Yes. The product $\mathrm{Swish}(xW)\odot xV$ is multiplicative in $x$; without the Swish it would be a *bilinear* (degree-2) function. Gating adds multiplicative interactions between features, which is part of why GLUs help.
+3. Column convention: $W_1 \in \mathbb{R}^{d_{ff} \times d}$, i.e. `(out, in)`, so the code is `sigma(x @ W1.T) @ W2.T`.

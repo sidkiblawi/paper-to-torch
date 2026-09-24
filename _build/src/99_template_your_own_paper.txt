@@ -1,0 +1,83 @@
+#%% md
+# Template — implement an equation from *any* paper
+
+Copy this notebook each time you practice on a new paper. Fill in each section **in order**, and don't skip to the code. The written sections are where the understanding happens.
+
+**Paper:** *title, authors, year*
+**Equation(s):** *section / equation numbers*
+
+---
+## Step 1 — Copy the equation exactly
+
+$$ \text{paste LaTeX here} $$
+
+Also copy the **sentences around it**. Initialization, scaling constants, and "where ..." definitions usually live in the prose (see notebook 08).
+
+## Step 2 — Symbol table
+
+| symbol | meaning | input / learned / hyperparameter | paper shape | code shape |
+|---|---|---|---|---|
+| | | | | |
+
+Things to check:
+- Column-vector ($Wx$) or row-vector ($xW$) convention?
+- 0- or 1-indexed ($t = 1..T$)?
+- Which symbols carry an implicit batch / sequence / head dimension?
+
+## Step 3 — Free vs. summed indices
+
+Write the equation in index notation. Free indices → output shape. Summed indices → reductions.
+
+$$ y_{\dots} = \sum_{\dots} \dots $$
+
+## Step 4 — Numerical hazards
+
+Look for `exp`, `log`, division, `sqrt`, a sum of many terms, and subtraction of near-equal numbers. What could overflow, underflow, or cancel? (See notebooks 01 and 09.)
+
+## Step 5 — The literal version (loops are fine)
+
+#%% code
+import math
+import torch
+import torch.nn.functional as F
+from p2t import check, check_grad, seed
+
+seed(0)
+
+
+def my_op_literal(*args):
+    """Direct transcription of the equation. Slow is fine."""
+    raise NotImplementedError
+
+#%% md
+## Step 6 — The vectorized version
+
+#%% code
+def my_op(*args):
+    """Batched, vectorized. Shape comments on every line."""
+    raise NotImplementedError
+
+#%% md
+## Step 7 — Tests
+
+Aim for at least one of each:
+- [ ] **vectorized == literal** on random inputs
+- [ ] **matches a reference** (a torch built-in or the authors' code) if one exists
+- [ ] **a property the paper claims** (invariance, sums to 1, equals $X$ at init, a closed form vs. Monte Carlo, ...)
+- [ ] **an extreme input** (huge/tiny values, all-masked rows, batch of 1)
+- [ ] **gradients** via `check_grad` if the op is part of training
+
+#%% code
+# check("vectorized == literal", my_op(...), my_op_literal(...))
+
+#%% md
+## Step 8 — Understand it: an experiment
+
+Change one thing and predict the outcome *before* running it: a hyperparameter, a scale, a dimension, removing a term. Plot something.
+
+#%% code
+
+#%% md
+## Step 9 — Explain it back
+
+In 3–5 sentences: what problem does this equation solve, why does it have this form, and what would break if you removed each term?
