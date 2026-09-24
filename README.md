@@ -36,9 +36,11 @@ Work in `exercises/`. Every `raise NotImplementedError` is yours to fill in, and
 | 09 | [DDPM](exercises/09_ddpm.ipynb) | Ho et al. 2020 | 1- vs 0-indexing; per-example broadcasting; oracle tests; a full training run |
 | 10 | [DPO](exercises/10_dpo.ipynb) | Rafailov et al. 2023 | Sequence log-probs (shift + mask); checking a paper's theorem empirically |
 | 11 | [MoE capstone](exercises/11_moe_capstone.ipynb) | Shazeer 2017; Switch Transformer | Dense reference → sparse implementation; partly non-differentiable losses |
+| 12 | [Inside `torch.nn`](exercises/12_inside_nn_module.ipynb) | Kaiming init; BatchNorm; Dropout | Rebuild `nn.Linear`, `BatchNorm1d`, `Dropout`, `Embedding` exactly; parameters vs. buffers; hooks |
+| 13 | [Inside the built-ins](exercises/13_inside_functional_autograd_optim.ipynb) | STE / VQ-VAE; SGDR | Full `F.cross_entropy` API; `autograd.Function`; `torch.optim.Optimizer` internals and schedulers |
 | 99 | [Template: your own paper](exercises/99_template_your_own_paper.ipynb) | any | A reusable worksheet for practicing on new papers |
 
-Notebooks 00 and 01 are prerequisites for the rest. After those, 02–08 can be done in any order. Notebooks 09–11 are longer and assume the earlier ones.
+Notebooks 00 and 01 are prerequisites for the rest. After those, 02–08 can be done in any order. Notebooks 09–11 are longer and assume the earlier ones. Notebooks 12–13 open up the PyTorch built-ins the other notebooks use as reference answers. You can do them any time after 01 (and 13 after 07). Notebook 12 is good preparation for 08.
 
 ## The recipe (short version)
 

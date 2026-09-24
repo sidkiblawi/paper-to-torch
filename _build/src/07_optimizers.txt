@@ -196,6 +196,8 @@ print("✅ L2 regularization and decoupled weight decay produce different soluti
 2. Adam's update magnitude is roughly bounded by $\alpha$ regardless of the gradient scale. Show this from the equations. What happens to the effective step for a parameter whose gradient is always 0?
 3. Adam stores `m` and `v` per parameter. For a 7B-parameter model in fp32, how much memory is the optimizer state?
 
+*Going further:* notebook 13 turns `MySGD` into a real `torch.optim.Optimizer` subclass (param groups, checkpointable state) and builds an LR scheduler by hand.
+
 #%% md solution
 **Answers**
 1. The state has to persist across calls, and rebinding a name loses it. `no_grad` stops autograd from recording the parameter updates into the graph (and in-place ops on leaf tensors that require grad would otherwise raise an error).

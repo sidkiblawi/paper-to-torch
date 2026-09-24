@@ -1,0 +1,323 @@
+#%% md
+# 13 — Inside the built-ins: `F.cross_entropy`, `autograd.Function`, and `torch.optim`
+
+**Why this matters:** notebook 12 opened up `nn.Module`. This one covers the other three pieces of PyTorch you use in every training loop: the loss function (all of its options, not just the default call), autograd (how a built-in op defines its gradient), and the optimizer (the machinery around the update rule you wrote in notebook 07).
+
+**Papers**
+- Bengio, Léonard & Courville (2013), *Estimating or Propagating Gradients Through Stochastic Neurons*, §4 (straight-through estimator)
+- van den Oord et al. (2017), *Neural Discrete Representation Learning* (VQ-VAE), Eq. 3 (the `sg[·]` operator)
+- Loshchilov & Hutter (2016), *SGDR: Stochastic Gradient Descent with Warm Restarts*, Eq. 5
+
+**You will learn**
+- the full `F.cross_entropy` signature: `weight`, `ignore_index`, `reduction`, and extra dims
+- how to write a `torch.autograd.Function` with a hand-written backward, and how to test it with `gradcheck`
+- how a paper's "stop-gradient" becomes `.detach()`
+- `torch.optim.Optimizer` internals: `param_groups`, `state`, and what an LR scheduler really does
+
+**Prerequisites:** notebooks 01 and 07.
+
+#%% code
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from p2t import check, check_grad, seed
+
+seed(0)
+
+#%% md
+## 1. The whole `F.cross_entropy`
+
+In notebook 01 you wrote the textbook loss. The built-in has more options, and each one comes up in real papers:
+
+```python
+F.cross_entropy(input, target, weight=None, ignore_index=-100, reduction="mean", label_smoothing=0.0)
+```
+
+- **`weight: (C,)`** rescales each example's loss by the weight of its *true class*, which is used for class imbalance.
+- **`ignore_index`** drops every position whose target equals it. Language models set padding and prompt tokens to `-100` so they don't contribute to the loss.
+- **`reduction`** is `"none"` (per-element losses), `"sum"`, or `"mean"`.
+- **Extra dims:** `input` can be `(N, C, d1, d2, ...)` with `target: (N, d1, d2, ...)`. The **class dim is always dim 1**, not the last one.
+
+**Trap 1: what does "mean" divide by?** The loss is *not* the plain average of the `"none"` output. With weights and ignored positions, PyTorch computes a **weighted** mean:
+$$\mathcal{L} = \frac{\sum_n w_{y_n}\,\ell_n}{\sum_n w_{y_n}}, \qquad \text{sum over non-ignored } n,$$
+where $\ell_n = -\log p_{n,y_n}$. So the weights change the *relative* importance of examples, not the overall scale.
+
+**Trap 2: the class dim.** A language model produces logits of shape `(B, T, V)`. Passing that straight in with `target: (B, T)` fails, because PyTorch reads `T` as the class dim. You need `logits.transpose(1, 2)`, or you flatten both to `(B·T, V)` and `(B·T,)`.
+
+### Exercise 1 — the full cross-entropy
+
+Handle `(N, C)` and `(N, C, d1, ...)` inputs, `weight`, `ignore_index`, and all three reductions. You may use `F.log_softmax` now (you built it in notebook 01).
+
+Watch out: an ignored target like `-100` isn't a valid index for `gather`. Replace it with a real class index before gathering, then zero out those positions.
+
+#%% code
+def cross_entropy_full(logits, target, weight=None, ignore_index=-100, reduction="mean"):
+    """logits: (N, C, *rest), target: (N, *rest) int64."""
+    ### BEGIN SOLUTION
+    logp = F.log_softmax(logits, dim=1)                          # (N, C, *rest)
+    keep = target != ignore_index                                # (N, *rest)
+    safe_t = torch.where(keep, target, 0)                        # valid index everywhere
+    nll = -logp.gather(1, safe_t.unsqueeze(1)).squeeze(1)        # (N, *rest)
+    w = weight[safe_t] if weight is not None else torch.ones_like(nll)
+    w = w * keep                                                 # ignored positions get weight 0
+    losses = w * nll
+    if reduction == "none":
+        return losses
+    if reduction == "sum":
+        return losses.sum()
+    return losses.sum() / w.sum()
+    ### END SOLUTION
+
+#%% code
+N, C = 12, 5
+logits, y = torch.randn(N, C), torch.randint(0, C, (N,))
+y_ign = y.clone(); y_ign[[1, 4, 7]] = -100
+w = torch.rand(C) + 0.1
+for red in ["mean", "sum", "none"]:
+    check(f"plain, {red}", cross_entropy_full(logits, y, reduction=red), F.cross_entropy(logits, y, reduction=red))
+    check(f"weight + ignore_index, {red}", cross_entropy_full(logits, y_ign, w, reduction=red),
+          F.cross_entropy(logits, y_ign, w, reduction=red))
+check_grad("grad (weight + ignore)", lambda l: cross_entropy_full(l, y_ign, w),
+           lambda l: F.cross_entropy(l, y_ign, w), logits)
+
+# sequence-shaped: (B, T, V) logits from an LM, with padding
+B, T, V = 3, 7, 11
+lm_logits, tokens = torch.randn(B, T, V), torch.randint(0, V, (B, T))
+tokens[0, 5:] = -100; tokens[2, 3:] = -100
+check("LM loss via transpose(1, 2)", cross_entropy_full(lm_logits.transpose(1, 2), tokens),
+      F.cross_entropy(lm_logits.transpose(1, 2), tokens))
+check("LM loss via flatten", cross_entropy_full(lm_logits.reshape(-1, V), tokens.reshape(-1)),
+      F.cross_entropy(lm_logits.transpose(1, 2), tokens))
+
+#%% md
+Notice that the last check passes: flattening and transposing give the same answer because `"mean"` averages over **tokens**, not sequences. A batch with one long sequence and one short one therefore weights the long one more. Some papers average per sequence first and then over the batch. That gives a different loss, and when you reproduce a paper you have to find out which one it uses.
+
+`nn.CrossEntropyLoss` is only a module that stores these keyword arguments and calls `F.cross_entropy`. Almost every `nn.XxxLoss` works this way: the module form exists so a loss can sit in an `nn.Sequential` or a config file.
+
+## 2. Writing a built-in op: `torch.autograd.Function`
+
+Every differentiable PyTorch op is a **forward** plus a **backward** formula (in PyTorch's source, the backward formulas are listed in `derivatives.yaml`). Autograd chains the backwards together. You can add your own op the same way:
+
+```python
+class MyOp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)          # stash what backward needs
+        return f(x)
+
+    @staticmethod
+    def backward(ctx, grad_out):          # grad_out = dL/d(output)
+        (x,) = ctx.saved_tensors
+        return grad_out * f_prime(x)      # dL/dx, one return value per forward input
+
+y = MyOp.apply(x)
+```
+
+`backward` receives the upstream gradient and returns the gradient for each input (vector-Jacobian product). For an elementwise op, that's just `grad_out * f'(x)`.
+
+### Exercise 2 — SiLU with a hand-derived backward
+
+$\mathrm{SiLU}(x) = x\,\sigma(x)$ (notebook 05). Derive $\frac{d}{dx}$ yourself, using $\sigma' = \sigma(1-\sigma)$, then implement both passes. You may use `torch.sigmoid`, but not autograd, inside `backward`.
+
+#%% code
+class SiLUFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ### BEGIN SOLUTION
+        ctx.save_for_backward(x)
+        return x * torch.sigmoid(x)
+        ### END SOLUTION
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        ### BEGIN SOLUTION
+        (x,) = ctx.saved_tensors
+        s = torch.sigmoid(x)
+        return grad_out * s * (1 + x * (1 - s))  # σ + x·σ(1−σ)
+        ### END SOLUTION
+
+#%% code
+x = torch.randn(4, 9) * 3
+check("forward", SiLUFn.apply(x), F.silu(x))
+check_grad("backward vs F.silu", SiLUFn.apply, F.silu, x)
+xd = torch.randn(20, dtype=torch.float64, requires_grad=True)
+assert torch.autograd.gradcheck(SiLUFn.apply, (xd,)), "❌ gradcheck"
+print("✅ gradcheck (finite differences agree with your backward)")
+
+#%% md
+`gradcheck` compares your analytic backward against finite differences $\frac{f(x+h)-f(x-h)}{2h}$. Always run it in **float64**. In float32 the finite differences are too noisy, and correct code fails.
+
+## 3. Stop-gradient and the straight-through estimator
+
+Some papers need the gradient of something with *no* useful gradient: rounding, sampling, or `argmax`. Bengio et al. (2013) propose the **straight-through estimator (STE)**: use the hard op in the forward pass, and pretend it was the identity in the backward pass.
+
+VQ-VAE (Eq. 3) writes its loss with a **stop-gradient** operator $\mathrm{sg}[\cdot]$, "defined as identity at forward computation time and has zero partial derivatives". In PyTorch, $\mathrm{sg}[z]$ is `z.detach()`. The STE is then a one-liner:
+$$\mathrm{STE}(x) = x + \mathrm{sg}[\,h(x) - x\,]$$
+Its forward value is $h(x)$, and its gradient is $\partial x/\partial x = 1$.
+
+### Exercise 3 — two ways to write the STE for `round`
+
+Implement it as an `autograd.Function` (the explicit way) and with the `detach` trick (the way you'll see it in paper code), and check that they agree.
+
+#%% code
+class RoundSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ### BEGIN SOLUTION
+        return x.round()
+        ### END SOLUTION
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        ### BEGIN SOLUTION
+        return grad_out
+        ### END SOLUTION
+
+
+def round_ste_detach(x):
+    ### BEGIN SOLUTION
+    return x + (x.round() - x).detach()
+    ### END SOLUTION
+
+#%% code
+x = torch.randn(10) * 3
+check("forward is round", RoundSTE.apply(x), x.round())
+check("detach trick forward is round", round_ste_detach(x), x.round())
+check_grad("same gradient", RoundSTE.apply, round_ste_detach, x)
+xg = x.clone().requires_grad_(); xg.round().sum().backward()
+print("plain round() gradient (useless for learning):", xg.grad[:5].tolist())
+
+#%% md
+## 4. `torch.optim.Optimizer` from the inside
+
+In notebook 07 you wrote optimizers as plain classes holding lists. The real base class adds three things:
+
+- **`self.param_groups`**: a list of dicts, each with its own `"params"` list and its own hyperparameters. This is how you give biases no weight decay, or give a LoRA adapter a different learning rate from the base model.
+- **`self.state`**: a dict keyed by **parameter tensor**, holding per-parameter state such as momentum buffers. It's filled lazily on the first `step()`.
+- **`state_dict()` / `load_state_dict()`**, which work for free once you use the two fields above. That's what lets training resume from a checkpoint.
+
+You pass your default hyperparameters to `super().__init__(params, defaults)`. It fills any key a group didn't set.
+
+### Exercise 4 — SGD with momentum as a real `Optimizer`
+
+Same update as notebook 07 ($b \leftarrow \mu b + g$, $\theta \leftarrow \theta - \gamma b$, with $b_1 = g_1$), but read `lr` and `momentum` **from each group**, and store the buffer at `self.state[p]["momentum_buffer"]` (PyTorch's key name, so the checkpoints are compatible).
+
+#%% code
+class MySGD(torch.optim.Optimizer):
+    def __init__(self, params, lr, momentum=0.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum))
+
+    @torch.no_grad()
+    def step(self):
+        ### BEGIN SOLUTION
+        for group in self.param_groups:
+            lr, mu = group["lr"], group["momentum"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                d = p.grad
+                if mu != 0:
+                    st = self.state[p]
+                    if "momentum_buffer" not in st:
+                        st["momentum_buffer"] = d.clone()   # b_1 = g_1
+                    else:
+                        st["momentum_buffer"].mul_(mu).add_(d)
+                    d = st["momentum_buffer"]
+                p.add_(d, alpha=-lr)
+        ### END SOLUTION
+
+#%% code
+def make_problem():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 16), nn.Tanh(), nn.Linear(16, 1))
+    return model, torch.randn(64, 4), torch.randn(64, 1)
+
+
+def run(opt_cls, steps=30, resume_at=None):
+    model, X, y = make_problem()
+    groups = lambda: [  # different hyperparameters per group (fresh dicts: Optimizer mutates them)
+        {"params": model[0].parameters(), "lr": 0.05},
+        {"params": model[2].parameters(), "lr": 0.01, "momentum": 0.5},
+    ]
+    opt = opt_cls(groups(), lr=0.1, momentum=0.9)
+    for t in range(steps):
+        if t == resume_at:  # simulate a checkpoint round-trip mid-training
+            sd = opt.state_dict()
+            opt = opt_cls(groups(), lr=0.1, momentum=0.9)
+            opt.load_state_dict(sd)
+        opt.zero_grad()
+        ((model(X) - y) ** 2).mean().backward()
+        opt.step()
+    return torch.cat([p.detach().flatten() for p in model.parameters()])
+
+
+check("param groups", run(MySGD), run(torch.optim.SGD))
+check("survives state_dict round-trip", run(MySGD, resume_at=15), run(torch.optim.SGD))
+opt = MySGD([{"params": [nn.Parameter(torch.ones(1))], "lr": 0.3}], lr=0.1, momentum=0.9)
+print("a group that only set lr:", {k: v for k, v in opt.param_groups[0].items() if k != "params"})
+
+#%% md
+The resume check passes because `self.state` and `param_groups` hold *everything* the optimizer knows. If you'd kept a momentum buffer in a separate attribute (as in notebook 07), it would be lost at the checkpoint and training would silently restart momentum from zero.
+
+## 5. LR schedulers write `group["lr"]`
+
+An LR scheduler doesn't wrap or modify the optimizer's math. It **overwrites `group["lr"]`** before each step, and nothing more. So any schedule a paper describes can be implemented as a function of the step count.
+
+SGDR (Loshchilov & Hutter 2016), Eq. 5, without restarts:
+$$\eta_t = \eta_{min} + \tfrac12(\eta_{max} - \eta_{min})\left(1 + \cos\left(\frac{T_{cur}}{T_{max}}\pi\right)\right)$$
+
+### Exercise 5 — cosine schedule by hand
+
+Implement `cosine_lr`, then drive an optimizer with it by writing into `param_groups`. The test compares your LR history against `torch.optim.lr_scheduler.CosineAnnealingLR`.
+
+#%% code
+def cosine_lr(t, base_lr, T_max, eta_min=0.0):
+    ### BEGIN SOLUTION
+    return eta_min + 0.5 * (base_lr - eta_min) * (1 + math.cos(math.pi * t / T_max))
+    ### END SOLUTION
+
+
+def lr_history_manual(steps, base_lr, T_max, eta_min):
+    p = nn.Parameter(torch.zeros(1)); p.grad = torch.zeros(1)
+    opt, hist = torch.optim.SGD([p], lr=base_lr), []
+    for t in range(steps):
+        ### BEGIN SOLUTION
+        for g in opt.param_groups:
+            g["lr"] = cosine_lr(t, base_lr, T_max, eta_min)
+        ### END SOLUTION
+        hist.append(opt.param_groups[0]["lr"])
+        opt.step()
+    return hist
+
+#%% code
+def lr_history_torch(steps, base_lr, T_max, eta_min):
+    p = nn.Parameter(torch.zeros(1)); p.grad = torch.zeros(1)
+    opt = torch.optim.SGD([p], lr=base_lr)
+    sched, hist = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=T_max, eta_min=eta_min), []
+    for _ in range(steps):
+        hist.append(opt.param_groups[0]["lr"])
+        opt.step(); sched.step()
+    return hist
+
+mine, ref = lr_history_manual(60, 0.1, 40, 1e-3), lr_history_torch(60, 0.1, 40, 1e-3)
+check("cosine schedule matches CosineAnnealingLR", torch.tensor(mine), torch.tensor(ref))
+plt.plot(ref, lw=4, alpha=0.4, label="CosineAnnealingLR"); plt.plot(mine, "--", label="yours")
+plt.axvline(40, c="gray", ls=":"); plt.xlabel("step"); plt.ylabel("lr"); plt.legend(); plt.show()
+
+#%% md
+Look at the plot past `T_max = 40`. The cosine goes back **up**. `CosineAnnealingLR` doesn't clamp at $\eta_{min}$; it keeps following the cosine. If your training runs longer than `T_max`, the LR rises again. That's a common accident when someone changes the number of epochs but not the scheduler.
+
+## Reflection
+1. You train a classifier with `weight=w` and later multiply every entry of `w` by 10. With `reduction="mean"`, what happens to the loss and the gradients? With `reduction="sum"`?
+2. In `SiLUFn` you saved the input `x`. Some ops save their *output* instead (e.g. `sigmoid`, `exp`, `tanh`). Why is that possible for those ops, and why might it be preferred?
+3. With the STE, what does the model "think" the gradient of rounding is? When would that mislead training?
+4. Name two reasons a paper's training code might use more than one param group.
+
+#%% md solution
+**Answers**
+1. With `"mean"`, nothing changes: the weighted mean divides by $\sum w$, so the scale cancels. With `"sum"`, the loss and the gradients get 10× larger, which is equivalent to a 10× learning rate for SGD.
+2. Their derivatives can be written in terms of the output: $\sigma' = y(1-y)$, $\exp' = y$, $\tanh' = 1 - y^2$. The output is often kept alive anyway by the next layer, so saving it costs no extra memory, and backward needs no recomputation.
+3. It treats rounding as the identity, so every small change in $x$ gets full gradient, even though most small changes don't move the rounded output at all. The estimate is biased. It works when the rounding error is small relative to the signal, and it misleads when values sit far from where rounding is roughly linear (very coarse grids, few bits). Quantization-aware training papers often learn the step size or add noise to reduce this mismatch.
+4. Excluding biases and norm parameters from weight decay (standard in transformer training). Different learning rates for different parts: a pretrained backbone vs. a new head, LoRA adapters vs. base weights, or layer-wise LR decay in fine-tuning.

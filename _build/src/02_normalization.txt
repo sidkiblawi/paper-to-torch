@@ -161,6 +161,8 @@ for name, f in layers.items():
 2. RMSNorm is scale-invariant but not shift-invariant. Why might dropping shift-invariance be acceptable in a transformer?
 3. What goes wrong with BatchNorm at batch size 1 in training mode? Try it.
 
+*Going further:* notebook 12 rebuilds `nn.BatchNorm1d` as a full module, with buffers, `train()`/`eval()`, and a `state_dict` compatible with PyTorch's.
+
 #%% md solution
 **Answers**
 1. BN2d: reduces over `(N, H, W)` and keeps `C`. ViT LayerNorm: reduces over the channel/embedding dim of each token. GroupNorm: reshape to `(N, G, C/G, H, W)` and reduce over `(C/G, H, W)`.

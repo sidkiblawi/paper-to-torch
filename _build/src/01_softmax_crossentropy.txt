@@ -199,6 +199,8 @@ plt.xlabel("temperature τ"); plt.ylabel("entropy (nats)"); plt.legend(); plt.sh
 2. If you only had `softmax` probabilities (not logits), how would you compute CE safely? What's lost?
 3. Why does `F.cross_entropy` accept class-probability targets as well as integer targets? Which paper-style losses need that?
 
+*Going further:* notebook 13 rebuilds the rest of `F.cross_entropy`'s API (`weight`, `ignore_index`, `reduction`, and sequence-shaped inputs).
+
 #%% md solution
 **Answers**
 1. Because softmax is shift-invariant, the gradient through $m$ is exactly zero mathematically: $\sum_i \partial\,\mathrm{softmax}_i/\partial m = 0$. Detaching doesn't change the result and saves a little compute. Many implementations do it.
